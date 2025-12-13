@@ -1,140 +1,280 @@
 --[[
 @module  usb_vuart_comm
-@summary Air8000 与 Hi3516cv610 USB虚拟串口通信模块
-@version 2.0
+@summary Air8000 与 Hi3516cv610 USB虚拟串口通信模块 (V1.0协议)
+@version 1.0
 @date    2025.12.13
 @description
-实现USB虚拟串口协议通信：
-- 协议格式: [CMD(1B)][LEN_H(1B)][LEN_L(1B)][DATA(N)]
-- 支持查询命令、控制命令、状态推送
-- 自动过滤日志，仅处理协议数据
+实现V1.0帧协议通信：
+- 帧格式: [0xAA][0x55][VER][TYPE][SEQ][CMD_H][CMD_L][LEN_H][LEN_L][DATA...][CRC_H][CRC_L]
+- 支持REQUEST/RESPONSE/ACK/NACK/NOTIFY帧类型
+- CRC-16/MODBUS校验
 
 @usage
     local usb_vuart = require "usb_vuart_comm"
 
-    -- 注册状态提供者
-    usb_vuart.register_status("sensor", function()
-        return string.char(0x01, 0x02, 0x03)
+    -- 注册命令处理器
+    usb_vuart.on_cmd(0x3001, function(seq, data)
+        -- 处理电机旋转命令
+        return usb_vuart.CMD_RESULT.ACK
     end)
-
-    -- 注册自定义命令处理
-    usb_vuart.on_cmd(0x30, function(data)
-        return pack_response(0x31, "response_data")
-    end)
-
-    -- 主动发送通知
-    usb_vuart.notify(0x10, "notification_data")
 ]]
 
 local usb_vuart = {}
 
--- ==================== 配置参数 ====================
-local UART_ID = uart.VUART_0  -- USB虚拟串口
-local BAUDRATE = 115200
+-- ==================== 协议常量 ====================
+local SYNC1 = 0xAA
+local SYNC2 = 0x55
+local VERSION = 0x10  -- V1.0
 
--- ==================== 命令定义 ====================
-usb_vuart.CMD = {
-    -- 查询命令 (Hi3516cv610 -> Air8000)
-    QUERY_SENSOR    = 0x11,   -- 查询传感器状态
-    QUERY_MOTOR     = 0x12,   -- 查询电机状态
-    QUERY_ALL       = 0x13,   -- 查询所有状态
-    QUERY_NETWORK   = 0x14,   -- 查询网络状态
+local HEADER_SIZE = 9
+local CRC_SIZE = 2
+local MIN_FRAME_SIZE = HEADER_SIZE + CRC_SIZE
 
-    -- 控制命令
-    MOTOR_CTRL      = 0x20,   -- 电机控制指令
-    SET_PARAM       = 0x21,   -- 设置参数
-
-    -- 响应命令 (Air8000 -> Hi3516cv610)
-    RESP_SENSOR     = 0x01,   -- 传感器状态响应
-    RESP_MOTOR      = 0x02,   -- 电机状态响应
-    RESP_ALL        = 0x03,   -- 所有状态响应
-    RESP_NETWORK    = 0x04,   -- 网络状态响应
-    RESP_ACK        = 0x05,   -- ACK响应
-    RESP_ERROR      = 0xFF,   -- 错误响应
+-- 帧类型
+usb_vuart.FRAME_TYPE = {
+    REQUEST   = 0x00,
+    RESPONSE  = 0x01,
+    NOTIFY    = 0x02,
+    ACK       = 0x03,
+    NACK      = 0x04,
 }
+
+-- 命令码定义 (16位)
+usb_vuart.CMD = {
+    -- 系统命令 (0x00xx)
+    SYS_PING      = 0x0001,
+    SYS_VERSION   = 0x0002,
+    SYS_RESET     = 0x0003,
+
+    -- 查询命令 (0x01xx)
+    QUERY_POWER   = 0x0101,
+    QUERY_STATUS  = 0x0102,
+    QUERY_NETWORK = 0x0103,
+
+    -- 电机命令 (0x30xx)
+    MOTOR_ROTATE     = 0x3001,
+    MOTOR_ENABLE     = 0x3002,
+    MOTOR_DISABLE    = 0x3003,
+    MOTOR_STOP       = 0x3004,
+    MOTOR_SET_ORIGIN = 0x3005,
+    MOTOR_GET_POS    = 0x3006,
+    MOTOR_SET_VEL    = 0x3007,
+    MOTOR_ROTATE_REL = 0x3008,
+    MOTOR_GET_ALL    = 0x3010,
+
+    -- 传感器命令 (0x40xx)
+    SENSOR_READ_TEMP = 0x4001,
+    SENSOR_READ_ALL  = 0x4002,
+
+    -- 设备控制命令 (0x50xx)
+    DEV_HEATER    = 0x5001,
+    DEV_FAN       = 0x5002,
+    DEV_LED       = 0x5003,
+    DEV_LASER     = 0x5004,
+    DEV_PWM_LIGHT = 0x5005,
+    DEV_GET_STATE = 0x5010,
+}
+
+-- 命令处理结果
+usb_vuart.CMD_RESULT = {
+    ACK = 1,       -- 发送ACK
+    NACK = 2,      -- 发送NACK
+    RESPONSE = 3,  -- 发送RESPONSE (需要data)
+    NONE = 4,      -- 不发送响应
+}
+
+-- 错误码
+usb_vuart.ERROR = {
+    UNKNOWN_CMD = 0x01,
+    INVALID_PARAM = 0x02,
+    DEVICE_BUSY = 0x03,
+    NOT_READY = 0x04,
+    EXEC_FAILED = 0x05,
+    TIMEOUT = 0x06,
+    CRC_ERROR = 0x07,
+    VERSION_UNSUPPORTED = 0x08,
+}
+
+-- ==================== 配置参数 ====================
+local UART_ID = uart.VUART_0
+local BAUDRATE = 115200
 
 -- ==================== 内部变量 ====================
 local is_initialized = false
 local rx_buff = nil
-local status_providers = {}   -- 状态数据提供者
-local cmd_handlers = {}       -- 命令处理器
+local parse_buffer = ""
+local cmd_handlers = {}
+local status_providers = {}
 
--- ==================== 工具函数 ====================
--- 打包响应数据
--- 格式: [命令(1B)] [数据长度(2B)] [数据(NB)]
-local function pack_response(cmd, data)
-    data = data or ""
-    local len = #data
-    local len_h = math.floor(len / 256)
-    local len_l = len % 256
-    return string.char(cmd, len_h, len_l) .. data
+-- ==================== CRC-16/MODBUS ====================
+local function crc16_modbus(data)
+    local crc = 0xFFFF
+    for i = 1, #data do
+        crc = bit.bxor(crc, data:byte(i))
+        for _ = 1, 8 do
+            if bit.band(crc, 0x0001) ~= 0 then
+                crc = bit.bxor(bit.rshift(crc, 1), 0xA001)
+            else
+                crc = bit.rshift(crc, 1)
+            end
+        end
+    end
+    return crc
 end
 
--- 解析请求数据
-local function parse_request(data)
-    if not data or #data < 1 then
-        return nil, "数据为空"
+-- ==================== 帧构造 ====================
+-- 构造完整帧
+local function build_frame(frame_type, seq, cmd, data)
+    data = data or ""
+    local data_len = #data
+
+    -- 构造帧头 (不含SYNC)
+    local header = string.char(
+        VERSION,
+        frame_type,
+        seq,
+        bit.rshift(cmd, 8),       -- CMD_H
+        bit.band(cmd, 0xFF),      -- CMD_L
+        bit.rshift(data_len, 8),  -- LEN_H
+        bit.band(data_len, 0xFF)  -- LEN_L
+    )
+
+    -- 计算CRC (从VER开始)
+    local crc_data = header .. data
+    local crc = crc16_modbus(crc_data)
+
+    -- 组装完整帧
+    return string.char(SYNC1, SYNC2) .. header .. data ..
+           string.char(bit.rshift(crc, 8), bit.band(crc, 0xFF))
+end
+
+-- 构造ACK帧
+local function build_ack(seq, cmd)
+    return build_frame(usb_vuart.FRAME_TYPE.ACK, seq, cmd, "")
+end
+
+-- 构造NACK帧
+local function build_nack(seq, cmd, error_code)
+    return build_frame(usb_vuart.FRAME_TYPE.NACK, seq, cmd, string.char(error_code))
+end
+
+-- 构造RESPONSE帧
+local function build_response(seq, cmd, data)
+    return build_frame(usb_vuart.FRAME_TYPE.RESPONSE, seq, cmd, data)
+end
+
+-- 构造NOTIFY帧
+local function build_notify(cmd, data)
+    return build_frame(usb_vuart.FRAME_TYPE.NOTIFY, 0, cmd, data)
+end
+
+-- ==================== 帧解析 ====================
+-- 解析一帧数据
+local function parse_frame(buffer)
+    -- 查找帧头
+    local header_pos = nil
+    for i = 1, #buffer - 1 do
+        if buffer:byte(i) == SYNC1 and buffer:byte(i + 1) == SYNC2 then
+            header_pos = i
+            break
+        end
     end
 
-    local cmd = data:byte(1)
-    local payload = data:sub(2)
+    if not header_pos then
+        return nil, nil, "未找到帧头"
+    end
 
-    return {
-        cmd = cmd,
-        data = payload
+    -- 移除帧头之前的数据
+    if header_pos > 1 then
+        buffer = buffer:sub(header_pos)
+    end
+
+    -- 检查最小长度
+    if #buffer < MIN_FRAME_SIZE then
+        return nil, buffer, "数据不完整"
+    end
+
+    -- 读取长度
+    local len_h = buffer:byte(8)
+    local len_l = buffer:byte(9)
+    local data_len = len_h * 256 + len_l
+
+    local total_len = HEADER_SIZE + data_len + CRC_SIZE
+
+    -- 检查数据是否完整
+    if #buffer < total_len then
+        return nil, buffer, "数据不完整"
+    end
+
+    -- 提取帧
+    local frame_data = buffer:sub(1, total_len)
+    local remaining = buffer:sub(total_len + 1)
+
+    -- 解析帧字段
+    local frame = {
+        version = frame_data:byte(3),
+        frame_type = frame_data:byte(4),
+        seq = frame_data:byte(5),
+        cmd = frame_data:byte(6) * 256 + frame_data:byte(7),
+        data_len = data_len,
+        data = data_len > 0 and frame_data:sub(10, 9 + data_len) or "",
+        crc = frame_data:byte(-2) * 256 + frame_data:byte(-1),
     }
+
+    return frame, remaining, nil
 end
 
 -- ==================== 请求处理 ====================
--- 处理客户端请求
-local function handle_request(request)
-    local cmd = request.cmd
-    local data = request.data
+local function handle_request(frame)
+    local seq = frame.seq
+    local cmd = frame.cmd
+    local data = frame.data
 
-    log.info("vuart", "处理请求", string.format("0x%02X", cmd))
+    log.info("vuart", string.format("处理请求 CMD=0x%04X SEQ=%d LEN=%d", cmd, seq, #data))
+
+    -- 检查版本
+    if frame.version ~= VERSION then
+        log.warn("vuart", "版本不支持", string.format("0x%02X", frame.version))
+        return build_nack(seq, cmd, usb_vuart.ERROR.VERSION_UNSUPPORTED)
+    end
 
     -- 先检查自定义处理器
     local handler = cmd_handlers[cmd]
     if handler then
-        local resp_data = handler(data)
-        if resp_data then
-            return resp_data
+        local result, resp_data, error_code = handler(seq, data)
+        if result == usb_vuart.CMD_RESULT.ACK then
+            return build_ack(seq, cmd)
+        elseif result == usb_vuart.CMD_RESULT.NACK then
+            return build_nack(seq, cmd, error_code or usb_vuart.ERROR.EXEC_FAILED)
+        elseif result == usb_vuart.CMD_RESULT.RESPONSE then
+            return build_response(seq, cmd, resp_data or "")
+        else
+            return nil  -- 不发送响应
         end
     end
 
-    -- 内置查询命令处理
-    if cmd == usb_vuart.CMD.QUERY_SENSOR then
-        -- 查询传感器状态
-        local provider = status_providers["sensor"]
-        if provider then
-            local sensor_data = provider()
-            return pack_response(usb_vuart.CMD.RESP_SENSOR, sensor_data)
-        else
-            return pack_response(usb_vuart.CMD.RESP_ERROR, string.char(0x01)) -- 无数据
-        end
+    -- 内置命令处理
+    if cmd == usb_vuart.CMD.SYS_PING then
+        return build_ack(seq, cmd)
 
-    elseif cmd == usb_vuart.CMD.QUERY_MOTOR then
-        -- 查询电机状态
-        local provider = status_providers["motor"]
-        if provider then
-            local motor_data = provider()
-            return pack_response(usb_vuart.CMD.RESP_MOTOR, motor_data)
-        else
-            return pack_response(usb_vuart.CMD.RESP_ERROR, string.char(0x02))
-        end
+    elseif cmd == usb_vuart.CMD.SYS_VERSION then
+        -- 返回版本: major, minor, patch + build string
+        local version_data = string.char(0, 0, 3) .. "AIR8000"
+        return build_response(seq, cmd, version_data)
 
     elseif cmd == usb_vuart.CMD.QUERY_NETWORK then
         -- 查询网络状态
-        local network_data = ""
+        local csq = mobile.csq() or 0
+        local rssi = mobile.rssi() or 0
+        local rsrp = mobile.rsrp() or 0
+        local status = mobile.status() or 0
 
-        -- 蜂窝网络状态
-        local csq = mobile.csq()
-        local rssi = mobile.rssi()
-        local rsrp = mobile.rsrp()
-        local status = mobile.status()
-
-        -- 打包网络信息 (格式: csq, rssi, rsrp, status)
-        network_data = string.char(csq, rssi & 0xFF, rsrp & 0xFF, status)
+        local network_data = string.char(
+            csq,
+            bit.band(rssi, 0xFF),
+            bit.band(rsrp, 0xFF),
+            status
+        )
 
         -- 添加IP地址
         local ip = socket.localIP(socket.LWIP_GP)
@@ -142,64 +282,72 @@ local function handle_request(request)
             network_data = network_data .. ip
         end
 
-        return pack_response(usb_vuart.CMD.RESP_NETWORK, network_data)
+        return build_response(seq, cmd, network_data)
 
-    elseif cmd == usb_vuart.CMD.QUERY_ALL then
-        -- 查询所有状态
-        local all_data = ""
-        for name, provider in pairs(status_providers) do
-            local d = provider()
-            if d then
-                all_data = all_data .. d
-            end
+    elseif cmd == usb_vuart.CMD.SENSOR_READ_ALL then
+        -- 读取所有传感器
+        local provider = status_providers["sensor"]
+        if provider then
+            local sensor_data = provider()
+            return build_response(seq, cmd, sensor_data)
+        else
+            return build_nack(seq, cmd, usb_vuart.ERROR.NOT_READY)
         end
-        return pack_response(usb_vuart.CMD.RESP_ALL, all_data)
 
-    elseif cmd == usb_vuart.CMD.MOTOR_CTRL then
-        -- 电机控制 - 发布消息让业务层处理
-        sys.publish("USB_MOTOR_CTRL", data)
-        return pack_response(usb_vuart.CMD.RESP_ACK, string.char(cmd))
-
-    elseif cmd == usb_vuart.CMD.SET_PARAM then
-        -- 设置参数
-        sys.publish("USB_SET_PARAM", data)
-        return pack_response(usb_vuart.CMD.RESP_ACK, string.char(cmd))
+    elseif cmd == usb_vuart.CMD.MOTOR_GET_ALL then
+        -- 查询所有电机状态
+        local provider = status_providers["motor"]
+        if provider then
+            local motor_data = provider()
+            return build_response(seq, cmd, motor_data)
+        else
+            return build_nack(seq, cmd, usb_vuart.ERROR.NOT_READY)
+        end
     end
 
     -- 未知命令
-    log.warn("vuart", "未知命令", string.format("0x%02X", cmd))
-    return pack_response(usb_vuart.CMD.RESP_ERROR, string.char(0xFF))
+    log.warn("vuart", "未知命令", string.format("0x%04X", cmd))
+    return build_nack(seq, cmd, usb_vuart.ERROR.UNKNOWN_CMD)
 end
 
 -- ==================== 串口接收处理 ====================
--- 串口接收回调
 local function uart_receive_callback(id, len)
     while true do
-        local len = uart.rx(id, rx_buff)
-        if len <= 0 then
+        local recv_len = uart.rx(id, rx_buff)
+        if recv_len <= 0 then
             break
         end
 
-        -- 获取接收到的数据
+        -- 获取接收到的数据并追加到解析缓冲区
         local recv_data = rx_buff:query()
         rx_buff:del()
+        parse_buffer = parse_buffer .. recv_data
 
-        if #recv_data > 0 then
-            -- 解析请求
-            local request, parse_err = parse_request(recv_data)
+        -- 尝试解析帧
+        while #parse_buffer >= MIN_FRAME_SIZE do
+            local frame, remaining, err = parse_frame(parse_buffer)
 
-            if request then
-                -- 处理请求并生成响应
-                local response = handle_request(request)
+            if frame then
+                parse_buffer = remaining or ""
 
-                -- 发送响应（使用uart.write符合官方规范）
-                uart.write(UART_ID, response)
-                log.info("vuart", "响应已发送", #response .. "字节")
+                -- 只处理REQUEST帧
+                if frame.frame_type == usb_vuart.FRAME_TYPE.REQUEST then
+                    local response = handle_request(frame)
+                    if response then
+                        uart.write(UART_ID, response)
+                        log.info("vuart", "响应已发送", #response .. "字节")
+                    end
+                else
+                    log.info("vuart", "忽略非REQUEST帧", string.format("TYPE=0x%02X", frame.frame_type))
+                end
             else
-                log.error("vuart", "解析请求失败", parse_err)
-                -- 发送错误响应
-                local err_resp = pack_response(usb_vuart.CMD.RESP_ERROR, string.char(0xFE))
-                uart.write(UART_ID, err_resp)
+                -- 数据不完整，等待更多数据
+                if err == "未找到帧头" and #parse_buffer > 256 then
+                    -- 缓冲区太大但找不到帧头，清理
+                    parse_buffer = ""
+                    log.warn("vuart", "清理无效数据")
+                end
+                break
             end
         end
     end
@@ -212,10 +360,11 @@ function usb_vuart.init()
         return true
     end
 
-    log.info("vuart", "初始化USB虚拟串口通信")
+    log.info("vuart", "初始化USB虚拟串口通信 V1.0")
 
     -- 创建接收缓冲区
     rx_buff = zbuff.create(1024)
+    parse_buffer = ""
 
     -- 配置串口
     uart.setup(UART_ID, BAUDRATE, 8, 1)
@@ -226,16 +375,17 @@ function usb_vuart.init()
     is_initialized = true
 
     log.info("vuart", "USB虚拟串口通信已就绪")
-    log.info("vuart", "波特率:", BAUDRATE)
-    log.info("vuart", "等待Hi3516cv610连接...")
+    log.info("vuart", "协议版本: V1.0")
+    log.info("vuart", "帧格式: AA 55 [VER][TYPE][SEQ][CMD][LEN][DATA][CRC]")
 
     return true
 end
 
--- 关闭USB虚拟串口通信
+-- 关闭
 function usb_vuart.close()
     if is_initialized then
         is_initialized = false
+        parse_buffer = ""
 
         if rx_buff then
             rx_buff:del()
@@ -248,36 +398,55 @@ function usb_vuart.close()
 end
 
 -- ==================== 状态提供者注册 ====================
--- 注册状态数据提供者，用于查询时自动返回数据
--- name: "sensor", "motor" 等
--- provider: 返回状态数据的函数
 function usb_vuart.register_status(name, provider)
     status_providers[name] = provider
     log.info("vuart", "注册状态提供者", name)
 end
 
 -- ==================== 命令处理注册 ====================
--- 注册自定义命令处理器
--- cmd: 命令字节
--- handler: 处理函数，返回完整的响应数据（包含响应头）
+-- handler(seq, data) -> result, resp_data, error_code
 function usb_vuart.on_cmd(cmd, handler)
     cmd_handlers[cmd] = handler
-    log.info("vuart", "注册命令处理", string.format("0x%02X", cmd))
+    log.info("vuart", "注册命令处理", string.format("0x%04X", cmd))
 end
 
 -- ==================== 主动发送 ====================
--- 主动向Hi3516cv610发送通知
 function usb_vuart.notify(cmd, data)
     if not is_initialized then
         log.warn("vuart", "串口未初始化")
         return false
     end
 
-    local notification = pack_response(cmd, data)
+    local notification = build_notify(cmd, data)
     uart.write(UART_ID, notification)
-    log.info("vuart", "发送通知", string.format("0x%02X", cmd), #notification .. "字节")
+    log.info("vuart", "发送通知", string.format("0x%04X", cmd), #notification .. "字节")
     return true
 end
+
+-- 发送响应 (用于异步响应)
+function usb_vuart.send_response(seq, cmd, data)
+    if not is_initialized then
+        return false
+    end
+    local response = build_response(seq, cmd, data)
+    uart.write(UART_ID, response)
+    return true
+end
+
+-- 发送ACK
+function usb_vuart.send_ack(seq, cmd)
+    if not is_initialized then
+        return false
+    end
+    local ack = build_ack(seq, cmd)
+    uart.write(UART_ID, ack)
+    return true
+end
+
+-- ==================== 导出构造函数 ====================
+usb_vuart.build_frame = build_frame
+usb_vuart.build_response = build_response
+usb_vuart.build_notify = build_notify
 
 -- ==================== 自动初始化 ====================
 usb_vuart.init()
