@@ -1,0 +1,32 @@
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Office temporary files
+~$*.xlsx
+~$*.docx
+
+# Build outputs
+*.o
+*.so
+*.a
+vuart_client
+*.elf
+
+# LuatOS
+LuatOS-master/
