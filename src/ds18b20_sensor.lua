@@ -1,87 +1,98 @@
 --[[
 @module  ds18b20_sensor
-@summary Air8000 OneWire DS18B20温度传感器模块
+@summary Air8000 DS18B20温度传感器模块 (基于官方onewire示例)
 @version 1.0
-@date    2025.12.13
+@date    2025.12.18
 @author  VDM
-@usage
-在main.lua中引用：
-    local ds18b20 = require "ds18b20_sensor"
-
-    -- 注册DS18B20状态提供者
-    usb_vuart.register_status("ds18b20", function()
-        return ds18b20.read_temperature_data()
-    end)
-
-    -- 或者注册自定义命令
-    usb_vuart.on_cmd(0x15, function(data)
-        local temp_data = ds18b20.read_temperature_data()
-        return pack_response(0x06, temp_data)
-    end)
+@description
+单个DS18B20设备,使用SKIP ROM命令,简化实现
 ]]
 
 local ds18b20 = {}
 
 -- ==================== 配置参数 ====================
-local ONEWIRE_PIN = 7  -- OneWire数据引脚，根据实际硬件修改
-local ds18b20_devices = {}  -- 发现的DS18B20设备列表
+local ONEWIRE_ID = 0  -- OneWire总线ID (默认GPIO2)
 
--- ==================== OneWire初始化 ====================
-local sensor = require "sensor"
-local w1Id = 0  -- OneWire总线ID
-
+-- ==================== 初始化 ====================
 function ds18b20.init()
-    -- 初始化OneWire
-    if sensor.w1_setup then
-        sensor.w1_setup(w1Id, ONEWIRE_PIN)
-        log.info("ds18b20", "OneWire初始化成功，引脚:", ONEWIRE_PIN)
-
-        -- 搜索总线上的DS18B20设备
-        ds18b20.scan_devices()
-        return true
-    else
-        log.error("ds18b20", "OneWire功能不可用")
+    if not onewire then
+        log.error("ds18b20", "onewire库不可用")
         return false
     end
+
+    -- 初始化OneWire (参考官方示例)
+    onewire.init(ONEWIRE_ID)
+    onewire.timing(ONEWIRE_ID, false, 0, 500, 500, 15, 240, 70, 1, 15, 10, 2)
+
+    log.info("ds18b20", "OneWire初始化完成 (单设备模式)")
+    return true
 end
 
 -- ==================== 设备扫描 ====================
 function ds18b20.scan_devices()
-    -- 扫描OneWire总线上的所有DS18B20设备
-    if sensor.ds18b20 then
-        local count = 0
-        -- 遍历所有可能的设备地址
-        for i = 0, 7 do
-            local temp = sensor.ds18b20(w1Id, i)
-            if temp then
-                ds18b20_devices[count] = i
-                count = count + 1
-                log.info("ds18b20", string.format("发现设备 #%d，地址: %d", count, i))
-            end
-        end
-
-        log.info("ds18b20", "扫描完成，发现", count, "个DS18B20设备")
-        return count
-    else
-        log.error("ds18b20", "DS18B20传感器不支持")
-        return 0
-    end
+    -- 单设备模式,总是返回1
+    return 1
 end
 
--- ==================== 温度读取 ====================
--- 读取单个DS18B20温度
+-- ==================== 温度读取 (参考官方示例) ====================
 function ds18b20.read_single(device_index)
-    if sensor.ds18b20 then
-        local temp = sensor.ds18b20(w1Id, device_index or 0)
-        if temp then
-            log.info("ds18b20", string.format("设备%d温度: %.2f°C", device_index or 0, temp / 1000.0))
-            return temp  -- 返回温度值（单位：毫度）
-        else
-            log.warn("ds18b20", "读取设备", device_index or 0, "失败")
+    if not onewire then
+        return nil
+    end
+
+    local tbuff = zbuff.create(10)
+    local rbuff = zbuff.create(9)
+    local succ, rx_data, crc8c, range, t
+
+    -- 单设备模式: 使用SKIP ROM (参考官方示例)
+    tbuff:write(0xcc, 0xb8)  -- SKIP ROM + 0xb8
+
+    -- 发送温度转换命令
+    tbuff[tbuff:used() - 1] = 0x44  -- CONVERT T
+    succ = onewire.tx(ONEWIRE_ID, tbuff, false, true, true)
+    if not succ then
+        return nil
+    end
+
+    -- 等待转换完成 (参考官方示例)
+    while true do
+        succ = onewire.reset(ONEWIRE_ID, true)
+        if not succ then
             return nil
         end
+        if onewire.bit(ONEWIRE_ID) > 0 then
+            break
+        end
+        sys.wait(10)
     end
-    return nil
+
+    -- 读取温度数据
+    tbuff[tbuff:used() - 1] = 0xbe  -- READ SCRATCHPAD
+    succ = onewire.tx(ONEWIRE_ID, tbuff, false, true, true)
+    if not succ then
+        return nil
+    end
+
+    succ, rx_data = onewire.rx(ONEWIRE_ID, 9, nil, rbuff, false, false, false)
+    if not succ then
+        return nil
+    end
+
+    -- 验证CRC (参考官方示例)
+    crc8c = crypto.crc8(rbuff:toStr(0, 8), 0x31, 0, true)
+    if crc8c ~= rbuff[8] then
+        log.warn("ds18b20", "数据CRC校验失败")
+        return nil
+    end
+
+    -- 解析温度数据 (参考官方示例)
+    range = (rbuff[4] >> 5) & 0x03
+    t = rbuff:query(0, 2, false, true)
+    t = t * (5000 >> range)
+    t = t / 10  -- 转换为毫度
+
+    log.info("ds18b20", string.format("温度: %.2f°C", t / 1000.0))
+    return math.floor(t)  -- 返回毫度
 end
 
 -- 读取所有DS18B20温度
@@ -89,34 +100,28 @@ function ds18b20.read_all()
     local temps = {}
     local count = 0
 
-    for i = 0, #ds18b20_devices do
-        local temp = ds18b20.read_single(i)
-        if temp then
-            temps[count] = temp
-            count = count + 1
-        end
+    local temp = ds18b20.read_single(0)
+    if temp then
+        temps[0] = temp
+        count = 1
     end
 
     return temps, count
 end
 
--- ==================== 数据打包 ====================
--- 将温度数据打包成二进制格式，供USB虚拟串口发送
--- 格式：[设备数量(1B)] [温度1(2B)] [温度2(2B)] ...
+-- 将温度数据打包成二进制格式
 function ds18b20.read_temperature_data()
     local temps, count = ds18b20.read_all()
 
     if count == 0 then
-        -- 没有检测到设备或读取失败
         return string.char(0x00)
     end
 
-    local data = string.char(count)  -- 第一个字节是设备数量
+    local data = string.char(count)
 
     for i = 0, count - 1 do
         local temp = temps[i]
-        -- 温度值转换为0.1°C单位的整数（例如25.6°C = 256）
-        local temp_int = math.floor(temp / 100)  -- temp是毫度，除以100得到0.1度
+        local temp_int = math.floor(temp / 100)
         local temp_h = math.floor(temp_int / 256)
         local temp_l = temp_int % 256
         data = data .. string.char(temp_h, temp_l)
@@ -125,19 +130,7 @@ function ds18b20.read_temperature_data()
     return data
 end
 
--- ==================== 定期采集（可选）====================
--- 启动定时采集任务
-function ds18b20.start_periodic_read(interval_ms)
-    interval_ms = interval_ms or 5000  -- 默认5秒
-
-    sys.timerLoopStart(function()
-        ds18b20.read_all()
-    end, interval_ms)
-
-    log.info("ds18b20", "启动定期采集，间隔:", interval_ms, "ms")
-end
-
--- ==================== 测试函数 ====================
+-- 测试函数
 function ds18b20.test()
     log.info("ds18b20", "======== DS18B20测试 ========")
 
@@ -146,7 +139,6 @@ function ds18b20.test()
         return false
     end
 
-    -- 读取温度
     local data = ds18b20.read_temperature_data()
     local count = data:byte(1)
 

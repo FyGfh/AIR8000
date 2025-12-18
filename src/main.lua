@@ -1,7 +1,7 @@
 --[[
 @module  main
 @summary VDM Air8000 双通道通信系统 (V1.0协议)
-@version 3.0
+@version 1.0
 @date    2025.12.13
 @description
 本项目实现Air8000与Hi3516cv610的双通道通信：
@@ -31,13 +31,26 @@ local CMD = usb_vuart.CMD
 local RESULT = usb_vuart.CMD_RESULT
 local ERROR = usb_vuart.ERROR
 
+-- ==================== 3.1 初始化 DS18B20 温度传感器 ====================
+local ds18b20 = require "ds18b20_sensor"
+ds18b20.init()
+
 -- ==================== 4. 业务数据状态 ====================
 local sensor_data = {
-    temperature = 25,
+    temperature = -99,   -- 将由 DS18B20 更新
     humidity = 60,
     battery = 80,
     light = 128,
 }
+
+-- ==================== 4.1 ADC 配置 ====================
+-- ADC 通道配置
+local ADC_CHANNEL_VBATT = 0     -- 电池电压 ADC 通道
+local ADC_CHANNEL_V12 = 1       -- 12V 电压 ADC 通道
+local ADC_VREF = 1024           -- ADC 参考电压 (mV) - Air8000 内部参考
+local ADC_RESOLUTION = 4096     -- 12位 ADC
+local VBATT_DIVIDER_RATIO = 11  -- 电池电压分压比 (根据实际电路)
+local V12_DIVIDER_RATIO = 11    -- 12V 电压分压比 (根据实际电路)
 
 -- 根据实际需求配置电机数量
 local motor_status = {}
@@ -53,7 +66,14 @@ end
 -- ==================== 5. 状态数据提供者 ====================
 -- 传感器状态
 usb_vuart.register_status("sensor", function()
-    local temp = math.floor(sensor_data.temperature * 10)
+    -- 读取 DS18B20 温度 (实时)
+    local temp_raw = ds18b20.read_single(0)
+    local temperature = sensor_data.temperature  -- 默认值
+    if temp_raw then
+        temperature = temp_raw / 1000.0  -- 毫度转换为度
+    end
+
+    local temp = math.floor(temperature * 10)
     local temp_h = math.floor(temp / 256)
     local temp_l = temp % 256
     return string.char(temp_h, temp_l, sensor_data.humidity, sensor_data.light, sensor_data.battery)
@@ -69,6 +89,11 @@ usb_vuart.register_status("motor", function()
         data = data .. string.char(i, m.action, speed_h, speed_l)
     end
     return data
+end)
+
+-- DS18B20 温度状态
+usb_vuart.register_status("ds18b20", function()
+    return ds18b20.read_temperature_data()
 end)
 
 -- ==================== 6. 电机命令处理 ====================
@@ -246,22 +271,98 @@ end)
 
 -- ==================== 8. 传感器命令 ====================
 
--- 读取温度 (0x4001)
+-- 读取温度 (0x4001) - 使用 DS18B20 传感器
 usb_vuart.on_cmd(CMD.SENSOR_READ_TEMP, function(seq, data)
     if #data >= 1 then
         local sensor_id = data:byte(1)
-        local temp = sensor_data.temperature
+        -- 读取 DS18B20 温度 (只有一个传感器，忽略 sensor_id)
+        local temp_raw = ds18b20.read_single(0)
+        local temp = 25.0  -- 默认值
+        if temp_raw then
+            temp = temp_raw / 1000.0  -- 毫度转换为度
+        end
         -- 响应格式: [sensor_id u8][temperature f32 大端序]
         local temp_bytes = string.pack(">f", temp)
+        log.info("sensor", string.format("DS18B20 温度: %.2f°C", temp))
         return RESULT.RESPONSE, string.char(sensor_id) .. temp_bytes
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
--- ==================== 9. 定期任务 ====================
--- 传感器数据模拟（生产环境请替换为真实传感器读取）
+-- ==================== 9. ADC 电压查询命令 ====================
+
+-- 读取 ADC 电压 (0x0101 QUERY_POWER)
+usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
+    if not adc then
+        log.warn("adc", "ADC功能不可用")
+        -- 使用模拟值
+        local mock_vbatt = 12500  -- 12.5V
+        local mock_v12 = 12000    -- 12.0V
+        local resp_data = string.char(
+            bit.rshift(mock_vbatt, 8), bit.band(mock_vbatt, 0xFF),
+            bit.rshift(mock_v12, 8), bit.band(mock_v12, 0xFF)
+        )
+        return RESULT.RESPONSE, resp_data
+    end
+
+    -- ADC采样函数 (参考官方示例)
+    local function read_adc_samples(channel, num_samples)
+        adc.setRange(adc.ADC_RANGE_MAX)  -- 设置量程为最大(0-3.6V)
+        adc.open(channel)
+
+        local samples = {}
+        for i = 1, num_samples do
+            table.insert(samples, adc.get(channel))
+        end
+
+        adc.close(channel)
+
+        -- 排序并去掉极值
+        if #samples > 2 then
+            table.sort(samples)
+            local sum = 0
+            for i = 2, #samples - 1 do
+                sum = sum + samples[i]
+            end
+            return sum / (#samples - 2)  -- 返回平均值(mV)
+        else
+            return samples[1] or 0
+        end
+    end
+
+    -- 读取电池电压ADC
+    local vbatt_adc = read_adc_samples(ADC_CHANNEL_VBATT, 5)
+
+    -- 读取12V电压ADC
+    local v12_adc = read_adc_samples(ADC_CHANNEL_V12, 5)
+
+    -- adc.get()返回的是mV,需要乘以分压比得到实际电压
+    local vbatt_mv = math.floor(vbatt_adc * VBATT_DIVIDER_RATIO)
+    local v12_mv = math.floor(v12_adc * V12_DIVIDER_RATIO)
+
+    -- 响应格式: [voltage_mv u16 大端][current_ma u16 大端]
+    -- 这里 current_ma 字段复用存储 12V 电压
+    local resp_data = string.char(
+        bit.rshift(vbatt_mv, 8), bit.band(vbatt_mv, 0xFF),  -- 电池电压高低字节
+        bit.rshift(v12_mv, 8), bit.band(v12_mv, 0xFF)       -- 12V电压高低字节
+    )
+
+    log.info("adc", string.format("电池电压: %dmV (ADC=%.0fmV), 12V电压: %dmV (ADC=%.0fmV)",
+        vbatt_mv, vbatt_adc, v12_mv, v12_adc))
+
+    return RESULT.RESPONSE, resp_data
+end)
+
+-- ==================== 10. 定期任务 ====================
+-- DS18B20 温度定期采集
 sys.timerLoopStart(function()
-    sensor_data.temperature = 20 + math.random(0, 100) / 10
+    -- 读取 DS18B20 温度
+    local temp_raw = ds18b20.read_single(0)
+    if temp_raw then
+        sensor_data.temperature = temp_raw / 1000.0  -- 毫度转换为度
+        log.debug("sensor", string.format("DS18B20 温度更新: %.2f°C", sensor_data.temperature))
+    end
+    -- 其他传感器数据（如有）
     sensor_data.humidity = 50 + math.random(0, 20)
     sensor_data.light = math.random(50, 200)
 end, 5000)
@@ -274,13 +375,13 @@ sys.timerLoopStart(function()
     usb_vuart.notify(0x0002, notify_data)  -- 使用16位命令码
 end, 10000)
 
--- ==================== 10. 看门狗 ====================
+-- ==================== 11. 看门狗 ====================
 if wdt then
     wdt.init(9000)
     sys.timerLoopStart(wdt.feed, 3000)
 end
 
--- ==================== 11. 启动系统 ====================
+-- ==================== 12. 启动系统 ====================
 log.info("main", "VDM Air8000 V1.0协议 系统已启动")
 log.info("main", "帧格式: AA 55 [VER][TYPE][SEQ][CMD][LEN][DATA][CRC]")
 sys.run()
