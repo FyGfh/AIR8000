@@ -44,13 +44,17 @@ local sensor_data = {
 }
 
 -- ==================== 4.1 ADC 配置 ====================
--- ADC 通道配置
-local ADC_CHANNEL_VBATT = 0     -- 电池电压 ADC 通道
-local ADC_CHANNEL_V12 = 1       -- 12V 电压 ADC 通道
-local ADC_VREF = 1024           -- ADC 参考电压 (mV) - Air8000 内部参考
+-- ADC 通道配置 (Air8000: 0=ADC0, 1=ADC1)
+local ADC_CHANNEL_V12 = 0       -- 12V 电压 ADC 通道 (ADC0)
+local ADC_CHANNEL_VBATT = 1     -- 电池电压(4.2V) ADC 通道 (ADC1)
+local ADC_VREF = 1200           -- ADC 参考电压 (mV) - Air8000 内部参考 1.2V
 local ADC_RESOLUTION = 4096     -- 12位 ADC
-local VBATT_DIVIDER_RATIO = 11  -- 电池电压分压比 (根据实际电路)
-local V12_DIVIDER_RATIO = 11    -- 12V 电压分压比 (根据实际电路)
+-- 分压比根据多点实测数据校准:
+-- 数据点1: 实际10.04V, ADC引脚426.3mV → 分压比 = 23.55
+-- 数据点2: 实际8.05V, ADC引脚333.7mV → 分压比 = 24.12
+-- 平均分压比: (23.55 + 24.12) / 2 = 23.84
+local V12_DIVIDER_RATIO = 24.1   -- 12V 电压分压比 (多点校准)
+local VBATT_DIVIDER_RATIO = 9.0  -- 电池电压分压比 (实测校准)
 
 -- 根据实际需求配置电机数量
 local motor_status = {}
@@ -307,7 +311,9 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
 
     -- ADC采样函数 (参考官方示例)
     local function read_adc_samples(channel, num_samples)
-        adc.setRange(adc.ADC_RANGE_MAX)  -- 设置量程为最大(0-3.6V)
+        -- Air8000 ADC量程: ADC_RANGE_MAX (0-3.6V), ADC_RANGE_MIN (0-1.2V)
+        -- 对于分压后的电压，应该都在0-1.2V范围内，使用MAX量程
+        adc.setRange(adc.ADC_RANGE_MAX)
         adc.open(channel)
 
         local samples = {}
@@ -321,34 +327,43 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
         if #samples > 2 then
             table.sort(samples)
             local sum = 0
-            for i = 2, #samples - 1 do
+            for i = 2, num_samples do
                 sum = sum + samples[i]
             end
-            return sum / (#samples - 2)  -- 返回平均值(mV)
+            return sum / (#samples - 1)  -- 返回平均值(mV)
         else
             return samples[1] or 0
         end
     end
 
-    -- 读取电池电压ADC
-    local vbatt_adc = read_adc_samples(ADC_CHANNEL_VBATT, 5)
+    -- 读取12V电压ADC原始值 (ADC0)
+    local v12_adc_raw = read_adc_samples(ADC_CHANNEL_V12, 5)
 
-    -- 读取12V电压ADC
-    local v12_adc = read_adc_samples(ADC_CHANNEL_V12, 5)
+    -- 读取电池电压ADC原始值 (ADC1)
+    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 5)
 
-    -- adc.get()返回的是mV,需要乘以分压比得到实际电压
-    local vbatt_mv = math.floor(vbatt_adc * VBATT_DIVIDER_RATIO)
-    local v12_mv = math.floor(v12_adc * V12_DIVIDER_RATIO)
+    -- 确保原始值是整数
+    v12_adc_raw = math.floor(v12_adc_raw or 0)
+    vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
+
+    -- ADC原始值转换为实际电压
+    -- adc.get()返回的是ADC原始值(0-4095), 需要转换为mV
+    -- 转换公式: voltage_mv = (adc_raw / ADC_RESOLUTION) * ADC_VREF * 分压比
+    local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF      -- ADC引脚电压
+    local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF  -- ADC引脚电压
+
+    local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)        -- 实际12V电压
+    local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)  -- 实际电池电压
 
     -- 响应格式: [voltage_mv u16 大端][current_ma u16 大端]
-    -- 这里 current_ma 字段复用存储 12V 电压
+    -- 第一个字段：12V主电压, 第二个字段：电池电压
     local resp_data = string.char(
-        bit.rshift(vbatt_mv, 8), bit.band(vbatt_mv, 0xFF),  -- 电池电压高低字节
-        bit.rshift(v12_mv, 8), bit.band(v12_mv, 0xFF)       -- 12V电压高低字节
+        bit.rshift(v12_mv, 8), bit.band(v12_mv, 0xFF),      -- 12V电压高低字节
+        bit.rshift(vbatt_mv, 8), bit.band(vbatt_mv, 0xFF)   -- 电池电压高低字节
     )
 
-    log.info("adc", string.format("电池电压: %dmV (ADC=%.0fmV), 12V电压: %dmV (ADC=%.0fmV)",
-        vbatt_mv, vbatt_adc, v12_mv, v12_adc))
+    log.info("adc", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV VBATT=%dmV",
+        v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, vbatt_mv))
 
     return RESULT.RESPONSE, resp_data
 end)
@@ -366,6 +381,57 @@ sys.timerLoopStart(function()
     sensor_data.humidity = 50 + math.random(0, 20)
     sensor_data.light = math.random(50, 200)
 end, 5000)
+
+-- ADC电压定期采集（调试用）
+sys.timerLoopStart(function()
+    if not adc then
+        return
+    end
+
+    -- ADC采样函数
+    local function read_adc_samples(channel, num_samples)
+        adc.setRange(adc.ADC_RANGE_1_2)
+        adc.open(channel)
+
+        local samples = {}
+        for i = 1, num_samples do
+            table.insert(samples, adc.get(channel))
+        end
+
+        adc.close(channel)
+
+        -- 排序并去掉极值
+        if #samples > 2 then
+            table.sort(samples)
+            local sum = 0
+            for i = 2, #samples - 1 do
+                sum = sum + samples[i]
+            end
+            return sum / (#samples - 2)
+        else
+            return samples[1] or 0
+        end
+    end
+
+    -- 读取ADC原始值
+    local v12_adc_raw = read_adc_samples(ADC_CHANNEL_V12, 5)
+    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 5)
+
+    -- 确保原始值是整数
+    v12_adc_raw = math.floor(v12_adc_raw or 0)
+    vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
+
+    -- 转换为ADC引脚电压
+    local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF
+    local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF
+
+    -- 计算实际电压
+    local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)
+    local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)
+
+    log.info("adc_debug", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
+        v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
+end, 3000)
 
 -- 定期状态推送到Hi3516cv610（使用NOTIFY帧）
 sys.timerLoopStart(function()
