@@ -311,9 +311,7 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
 
     -- ADC采样函数 (参考官方示例)
     local function read_adc_samples(channel, num_samples)
-        -- Air8000 ADC量程: ADC_RANGE_MAX (0-3.6V), ADC_RANGE_MIN (0-1.2V)
-        -- 对于分压后的电压，应该都在0-1.2V范围内，使用MAX量程
-        adc.setRange(adc.ADC_RANGE_MAX)
+        adc.setRange(adc.ADC_RANGE_1_2)  -- Air8000 使用 1.2V 参考电压
         adc.open(channel)
 
         local samples = {}
@@ -327,10 +325,10 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
         if #samples > 2 then
             table.sort(samples)
             local sum = 0
-            for i = 2, num_samples do
+            for i = 2, #samples - 1 do
                 sum = sum + samples[i]
             end
-            return sum / (#samples - 1)  -- 返回平均值(mV)
+            return sum / (#samples - 2)  -- 返回平均值
         else
             return samples[1] or 0
         end
