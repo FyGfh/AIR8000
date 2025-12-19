@@ -47,14 +47,15 @@ local sensor_data = {
 -- ADC 通道配置 (Air8000: 0=ADC0, 1=ADC1)
 local ADC_CHANNEL_V12 = 0       -- 12V 电压 ADC 通道 (ADC0)
 local ADC_CHANNEL_VBATT = 1     -- 电池电压(4.2V) ADC 通道 (ADC1)
-local ADC_VREF = 1200           -- ADC 参考电压 (mV) - Air8000 内部参考 1.2V
-local ADC_RESOLUTION = 4096     -- 12位 ADC
+local ADC_VREF = 3600           -- ADC 参考电压 (mV) - Air8000 内部量程 0-3.6V
+local ADC_RESOLUTION = 4096     -- 12位 ADC (12 bits)
 -- 分压比根据多点实测数据校准:
 -- 数据点1: 实际10.04V, ADC引脚426.3mV → 分压比 = 23.55
 -- 数据点2: 实际8.05V, ADC引脚333.7mV → 分压比 = 24.12
--- 平均分压比: (23.55 + 24.12) / 2 = 23.84
-local V12_DIVIDER_RATIO = 24.1   -- 12V 电压分压比 (多点校准)
-local VBATT_DIVIDER_RATIO = 9.0  -- 电池电压分压比 (实测校准)
+-- 数据点3: 实际12.00V, ADC引脚522mV → 分压比 = 23.0
+-- 最新校准分压比: 23.0 (基于12V实测)
+local V12_DIVIDER_RATIO = 23.0    -- 12V 电压分压比 (12.00V实测校准)
+local VBATT_DIVIDER_RATIO = 5.0  -- 电池电压分压比 (4.2V实测，非常准确)
 
 -- 根据实际需求配置电机数量
 local motor_status = {}
@@ -300,8 +301,8 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
     if not adc then
         log.warn("adc", "ADC功能不可用")
         -- 使用模拟值
-        local mock_vbatt = 12500  -- 12.5V
-        local mock_v12 = 12000    -- 12.0V
+        local mock_vbatt = 0  -- 12.5V
+        local mock_v12 = 0    -- 12.0V
         local resp_data = string.char(
             bit.rshift(mock_vbatt, 8), bit.band(mock_vbatt, 0xFF),
             bit.rshift(mock_v12, 8), bit.band(mock_v12, 0xFF)
@@ -311,7 +312,7 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
 
     -- ADC采样函数 (参考官方示例)
     local function read_adc_samples(channel, num_samples)
-        adc.setRange(adc.ADC_RANGE_1_2)  -- Air8000 使用 1.2V 参考电压
+        adc.setRange(adc.ADC_RANGE_MAX)  -- Air8000 ADC 量程 0-3.6V (内部分压开启)
         adc.open(channel)
 
         local samples = {}
@@ -388,7 +389,7 @@ sys.timerLoopStart(function()
 
     -- ADC采样函数
     local function read_adc_samples(channel, num_samples)
-        adc.setRange(adc.ADC_RANGE_1_2)
+        adc.setRange(adc.ADC_RANGE_MAX)  -- Air8000 ADC 量程 0-3.6V (内部分压开启)
         adc.open(channel)
 
         local samples = {}
