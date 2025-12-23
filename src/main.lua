@@ -61,6 +61,15 @@ sys.taskInit(function()
                 log.warn("motor", string.format("电机%d (CAN ID: 0x%02X) 注册失败", i, can_id))
             end
         end
+
+        -- 初始化完成后，读取所有电机的初始位置，确保缓存有效
+        sys.wait(500)  -- 等待电机注册完成并读取参数
+        log.info("motor", "开始读取所有电机初始位置...")
+        for i, can_id in ipairs(MOTOR_CAN_IDS) do
+            dm_motor.read_register(can_id, 0x50)  -- 读取位置
+            sys.wait(100)  -- 等待CAN响应
+        end
+        log.info("motor", "所有电机初始位置已读取")
     else
         log.error("motor", "DM电机驱动初始化失败")
     end
@@ -267,18 +276,20 @@ end)
 
 -- 电机查询位置 (0x3006)
 -- 响应格式: [motor_id u8][position f32 大端序]
+-- 数据来源说明：
+--   1. 运动中的电机：每次控制命令的反馈帧会自动更新位置（实时，延迟 < 10ms）
+--   2. 静止的电机：后台定时任务每200ms读取一次位置
+--   3. 数据新鲜度：运动中 < 10ms，静止时 < 200ms
 usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
     if #data >= 1 then
         local motor_id = data:byte(1)
+
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 主动读取电机位置寄存器 (0x50)
-            dm_motor.read_register(can_id, 0x50)
-
-            -- 等待 CAN 响应 (100ms)
-            sys.wait(100)
-
+            -- 获取当前缓存的状态
+            -- 运动中的电机：位置由最近的控制反馈帧更新（实时，< 10ms）
+            -- 静止的电机：位置由后台定时任务更新（< 200ms）
             local state = dm_motor.get_state(can_id)
 
             if state then
@@ -288,11 +299,15 @@ usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
                 log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.4f rad (%.2f°)", motor_id, can_id, state.position, math.deg(state.position)))
                 return RESULT.RESPONSE, resp_data
             else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 状态查询失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 未注册或未初始化", motor_id, can_id))
+                return RESULT.NACK, nil, ERROR.NOT_READY
             end
+        else
+            log.error("motor", string.format("无效的电机ID: %d (范围: 1-%d)", motor_id, #MOTOR_CAN_IDS))
+            return RESULT.NACK, nil, ERROR.INVALID_PARAM
         end
     end
+    log.error("motor", "缺少电机ID参数")
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
@@ -582,6 +597,21 @@ sys.timerLoopStart(function()
     sensor_data.humidity = 50 + math.random(0, 20)
     sensor_data.light = math.random(50, 200)
 end, 5000)
+
+-- 定期更新电机位置状态（仅用于使能状态的静止电机）
+-- 注意：运动中的电机通过控制反馈帧实时更新，不需要额外读取
+sys.timerLoopStart(function()
+    for i, can_id in ipairs(MOTOR_CAN_IDS) do
+        local state = dm_motor.get_state(can_id)
+        -- 只对使能状态的静止电机定期读取位置
+        if state and state.enabled then
+            -- 静止状态（速度接近0）才读取，运动中的电机由控制反馈帧更新
+            if math.abs(state.velocity) < 0.01 then
+                dm_motor.read_register(can_id, 0x50)
+            end
+        end
+    end
+end, 200)  -- 200ms读取一次静止电机的位置，平衡实时性和性能
 
 -- ADC电压定期采集（调试用）
 sys.timerLoopStart(function()
