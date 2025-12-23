@@ -91,14 +91,14 @@ function dm_motor_bridge.enable(motor_can_id, enabled, mode)
     return dm_can.send_mode_command(motor_can_id, mode, cmd_type)
 end
 
--- 保存零点
+-- 保存零点（使用MIT模式）
 function dm_motor_bridge.save_zero(motor_can_id)
-    return dm_can.send_mode_command(motor_can_id, 1, "save_zero")
+    return dm_can.send_mode_command(motor_can_id, 1, "save_zero")  -- 使用MIT模式
 end
 
--- 清除错误
+-- 清除错误（使用MIT模式）
 function dm_motor_bridge.clear_error(motor_can_id)
-    return dm_can.send_mode_command(motor_can_id, 1, "clear_error")
+    return dm_can.send_mode_command(motor_can_id, 1, "clear_error")  -- 使用MIT模式
 end
 
 -- 读取寄存器

@@ -94,7 +94,7 @@ local function create_motor(can_id)
         mode = 0,                  -- 当前模式
         enabled = false,           -- 使能状态
         online = false,            -- 在线状态（是否有CAN响应）
-        last_response_time = 0,    -- 最后响应时间
+        response_counter = 0,      -- 响应计数器（每次收到CAN响应时递增）
     }
 end
 
@@ -218,7 +218,7 @@ local function parse_feedback_frame(motor, frame)
 
     -- 标记电机在线
     motor.online = true
-    motor.last_response_time = os.time()
+    motor.response_counter = motor.response_counter + 1  -- 响应计数器递增
 
     -- 解析错误状态
     local err = bit.rshift(bit.band(d0, 0xF0), 4)
@@ -272,7 +272,7 @@ local function parse_register_data(motor, rid, d4, d5, d6, d7)
 
     -- 标记电机在线
     motor.online = true
-    motor.last_response_time = os.time()
+    motor.response_counter = motor.response_counter + 1  -- 响应计数器递增
 
     -- 更新电机参数
     if rid == 0x07 then
@@ -450,7 +450,7 @@ function dm_motor.vel_control(motor_can_id, v_des)
     return can_send(can_id, can.STD, false, true, data)
 end
 
--- 电机使能/失能
+-- 电机使能/失能/保存零点/清除错误
 function dm_motor.send_mode_command(motor_can_id, mode, command_type)
     local motor = get_motor(motor_can_id)
     if not motor then return false end
@@ -474,7 +474,13 @@ function dm_motor.send_mode_command(motor_can_id, mode, command_type)
         return false
     end
 
-    return can_send(motor.can_id, can.STD, false, true, cmd_data)
+    -- 根据模式计算正确的 CAN ID
+    local can_id = mode_info.can_base + motor.can_id_l
+
+    log.info("dm_motor", string.format("发送%s命令: 电机0x%02X, 模式=%d(%s), CAN_ID=0x%03X, 数据=%s",
+        command_type, motor_can_id, mode, mode_info.name, can_id, cmd_data:toHex()))
+
+    return can_send(can_id, can.STD, false, true, cmd_data)
 end
 
 -- 切换控制模式
@@ -541,7 +547,7 @@ function dm_motor.get_state(motor_can_id)
         mode = motor.mode,
         enabled = motor.enabled,
         online = motor.online,
-        last_response_time = motor.last_response_time
+        response_counter = motor.response_counter
     }
 end
 

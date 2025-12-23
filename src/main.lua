@@ -276,10 +276,6 @@ end)
 
 -- 电机查询位置 (0x3006)
 -- 响应格式: [motor_id u8][position f32 大端序]
--- 数据来源说明：
---   1. 运动中的电机：每次控制命令的反馈帧会自动更新位置（实时，延迟 < 10ms）
---   2. 静止的电机：后台定时任务每200ms读取一次位置
---   3. 数据新鲜度：运动中 < 10ms，静止时 < 200ms
 usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
     if #data >= 1 then
         local motor_id = data:byte(1)
@@ -287,21 +283,33 @@ usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 获取当前缓存的状态
-            -- 运动中的电机：位置由最近的控制反馈帧更新（实时，< 10ms）
-            -- 静止的电机：位置由后台定时任务更新（< 200ms）
-            local state = dm_motor.get_state(can_id)
+            -- 记录查询前的响应计数器
+            local state_before = dm_motor.get_state(can_id)
+            local last_counter = state_before and state_before.response_counter or 0
 
-            if state then
-                -- 构造响应: [motor_id u8][position f32 大端序]
-                local pos_bytes = string.pack(">f", state.position)
-                local resp_data = string.char(motor_id) .. pos_bytes
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.4f rad (%.2f°)", motor_id, can_id, state.position, math.deg(state.position)))
-                return RESULT.RESPONSE, resp_data
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 未注册或未初始化", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.NOT_READY
+            -- 发送位置读取命令
+            dm_motor.read_register(can_id, 0x50)
+
+            -- 使用忙等待循环检查响应（最多50ms，增加等待时间）
+            local max_checks = 5000  -- 5000次检查 ≈ 50ms
+            for i = 1, max_checks do
+                local state_now = dm_motor.get_state(can_id)
+                -- 检查是否收到新的响应（计数器递增）
+                if state_now and state_now.response_counter > last_counter then
+                    -- 构造响应: [motor_id u8][position f32 大端序]
+                    local pos_bytes = string.pack(">f", state_now.position)
+                    local resp_data = string.char(motor_id) .. pos_bytes
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.4f rad (%.2f°) [第%d次响应]",
+                        motor_id, can_id, state_now.position, math.deg(state_now.position), state_now.response_counter))
+                    return RESULT.RESPONSE, resp_data
+                end
+                -- 微小延迟，让出一点CPU时间
+                for j = 1, 100 do end  -- 空循环作为延迟
             end
+
+            -- 超时 - 返回错误而不是缓存值
+            log.error("motor", string.format("电机%d (CAN:0x%02X) 读取超时，未收到CAN响应", motor_id, can_id))
+            return RESULT.NACK, nil, ERROR.TIMEOUT
         else
             log.error("motor", string.format("无效的电机ID: %d (范围: 1-%d)", motor_id, #MOTOR_CAN_IDS))
             return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -317,7 +325,37 @@ usb_vuart.on_cmd(CMD.MOTOR_SET_ORIGIN, function(seq, data)
         local motor_id = data:byte(1)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
-            -- 调用DM电机的保存零点命令
+
+            -- 获取电机当前状态
+            local state = dm_motor.get_state(can_id)
+            if not state then
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 未注册或未初始化", motor_id, can_id))
+                return RESULT.NACK, nil, ERROR.NOT_READY
+            end
+
+            log.info("motor", string.format("电机%d 设置零点前状态: enabled=%s, error_code=0x%X, position=%.2f",
+                motor_id, state.enabled and "true" or "false", state.error_code, state.position))
+
+            -- 如果电机已使能，先失能
+            if state.enabled then
+                log.info("motor", string.format("电机%d (CAN:0x%02X) 使能中，先失能后设置零点", motor_id, can_id))
+                dm_motor.enable(can_id, false, 1)  -- 失能（MIT模式）
+
+                -- 等待失能生效（忙等待约50ms）
+                for i = 1, 50000 do
+                    for j = 1, 100 do end
+                end
+
+                -- 检查失能是否生效
+                local state_after_disable = dm_motor.get_state(can_id)
+                if state_after_disable then
+                    log.info("motor", string.format("电机%d 失能后状态: enabled=%s, error_code=0x%X",
+                        motor_id, state_after_disable.enabled and "true" or "false", state_after_disable.error_code))
+                end
+            end
+
+            -- 调用DM电机的保存零点命令 (使用MIT模式)
+            log.info("motor", string.format("电机%d (CAN:0x%02X) 准备发送save_zero命令...", motor_id, can_id))
             if dm_motor.save_zero(can_id) then
                 motor_status[motor_id].position = 0
                 log.info("motor", string.format("电机%d (CAN:0x%02X) 已设置原点", motor_id, can_id))
@@ -597,21 +635,6 @@ sys.timerLoopStart(function()
     sensor_data.humidity = 50 + math.random(0, 20)
     sensor_data.light = math.random(50, 200)
 end, 5000)
-
--- 定期更新电机位置状态（仅查询在线的静止电机）
--- 注意：运动中的电机通过控制反馈帧实时更新，但仍需定期读取以确保数据同步
-sys.timerLoopStart(function()
-    for i, can_id in ipairs(MOTOR_CAN_IDS) do
-        local state = dm_motor.get_state(can_id)
-        -- 只查询在线的静止电机（online=true 且 velocity<0.01）
-        if state and state.online then
-            -- 静止状态（速度接近0）才读取，运动中的电机由控制反馈帧更新
-            if math.abs(state.velocity) < 0.01 then
-                dm_motor.read_register(can_id, 0x50)
-            end
-        end
-    end
-end, 200)  -- 200ms读取一次静止电机的位置，平衡实时性和性能
 
 -- ADC电压定期采集（调试用）
 sys.timerLoopStart(function()
