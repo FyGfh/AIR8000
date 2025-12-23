@@ -67,12 +67,13 @@ usb_vuart.CMD = {
     SENSOR_READ_ALL  = 0x4002,
 
     -- 设备控制命令 (0x50xx)
-    DEV_HEATER    = 0x5001,
-    DEV_FAN       = 0x5002,
-    DEV_LED       = 0x5003,
-    DEV_LASER     = 0x5004,
-    DEV_PWM_LIGHT = 0x5005,
-    DEV_GET_STATE = 0x5010,
+    DEV_HEATER      = 0x5001,
+    DEV_FAN         = 0x5002,
+    DEV_LED         = 0x5003,
+    DEV_LASER       = 0x5004,
+    DEV_PWM_LIGHT   = 0x5005,
+    DEV_MOTOR_POWER = 0x5006,  -- 电机供电控制
+    DEV_GET_STATE   = 0x5010,
 }
 
 -- 命令处理结果
@@ -269,12 +270,44 @@ local function handle_request(frame)
         local rsrp = mobile.rsrp() or 0
         local status = mobile.status() or 0
 
+        -- 获取SIM卡ICCID（SIM卡号，通常是20位数字）
+        local iccid = mobile.iccid() or ""
+
+        -- 获取IMSI（国际移动用户识别码，用于识别运营商）
+        local imsi = mobile.imsi() or ""
+
+        -- 从IMSI解析运营商代码 (MCC+MNC)
+        -- IMSI格式: MCCMNC + 用户ID
+        -- 中国移动: 46000, 46002, 46007, 46008
+        -- 中国联通: 46001, 46006, 46009
+        -- 中国电信: 46003, 46005, 46011
+        local operator = 0  -- 0=未知, 1=中国移动, 2=中国联通, 3=中国电信
+        if #imsi >= 5 then
+            local mccmnc = imsi:sub(1, 5)
+            if mccmnc == "46000" or mccmnc == "46002" or mccmnc == "46007" or mccmnc == "46008" then
+                operator = 1  -- 中国移动
+            elseif mccmnc == "46001" or mccmnc == "46006" or mccmnc == "46009" then
+                operator = 2  -- 中国联通
+            elseif mccmnc == "46003" or mccmnc == "46005" or mccmnc == "46011" then
+                operator = 3  -- 中国电信
+            end
+        end
+
+        -- 限制ICCID长度为20字节（标准ICCID长度）
+        if #iccid > 20 then
+            iccid = iccid:sub(1, 20)
+        elseif #iccid < 20 then
+            iccid = iccid .. string.rep("\0", 20 - #iccid)  -- 填充0
+        end
+
+        -- 网络数据格式: [csq][rssi][rsrp][status][operator][iccid(20字节)]
         local network_data = string.char(
             csq,
             bit.band(rssi, 0xFF),
             bit.band(rsrp, 0xFF),
-            status
-        )
+            status,
+            operator
+        ) .. iccid
 
         -- 添加IP地址
         local ip = socket.localIP(socket.LWIP_GP)
