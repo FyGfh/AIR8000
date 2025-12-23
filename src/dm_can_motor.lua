@@ -93,6 +93,8 @@ local function create_motor(can_id)
         error_code = 0,            -- 错误码
         mode = 0,                  -- 当前模式
         enabled = false,           -- 使能状态
+        online = false,            -- 在线状态（是否有CAN响应）
+        last_response_time = 0,    -- 最后响应时间
     }
 end
 
@@ -214,6 +216,10 @@ local function parse_feedback_frame(motor, frame)
     local d6 = string.byte(frame, 7)
     local d7 = string.byte(frame, 8)
 
+    -- 标记电机在线
+    motor.online = true
+    motor.last_response_time = os.time()
+
     -- 解析错误状态
     local err = bit.rshift(bit.band(d0, 0xF0), 4)
     motor.error_code = err
@@ -264,6 +270,10 @@ local function parse_register_data(motor, rid, d4, d5, d6, d7)
         value = raw_value
     end
 
+    -- 标记电机在线
+    motor.online = true
+    motor.last_response_time = os.time()
+
     -- 更新电机参数
     if rid == 0x07 then
         motor.mst_id = value
@@ -278,15 +288,15 @@ local function parse_register_data(motor, rid, d4, d5, d6, d7)
     elseif rid == 0x50 then
         -- 位置寄存器反馈
         motor.position = value
-        log.info("dm_motor", string.format("电机0x%02X 位置寄存器反馈: %.2f rad", motor.can_id, value))
+        log.debug("dm_motor", string.format("电机0x%02X 位置寄存器反馈: %.2f rad", motor.can_id, value))
     elseif rid == 0x51 then
         -- 速度寄存器反馈
         motor.velocity = value
-        log.info("dm_motor", string.format("电机0x%02X 速度寄存器反馈: %.2f rad/s", motor.can_id, value))
+        log.debug("dm_motor", string.format("电机0x%02X 速度寄存器反馈: %.2f rad/s", motor.can_id, value))
     elseif rid == 0x52 then
         -- 扭矩寄存器反馈
         motor.torque = value
-        log.info("dm_motor", string.format("电机0x%02X 扭矩寄存器反馈: %.2f Nm", motor.can_id, value))
+        log.debug("dm_motor", string.format("电机0x%02X 扭矩寄存器反馈: %.2f Nm", motor.can_id, value))
     end
 
     if rid ~= 0x50 and rid ~= 0x51 and rid ~= 0x52 then
@@ -529,7 +539,9 @@ function dm_motor.get_state(motor_can_id)
         temperature_rotor = motor.temperature_rotor,
         error_code = motor.error_code,
         mode = motor.mode,
-        enabled = motor.enabled
+        enabled = motor.enabled,
+        online = motor.online,
+        last_response_time = motor.last_response_time
     }
 end
 

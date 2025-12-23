@@ -598,13 +598,13 @@ sys.timerLoopStart(function()
     sensor_data.light = math.random(50, 200)
 end, 5000)
 
--- 定期更新电机位置状态（仅用于使能状态的静止电机）
--- 注意：运动中的电机通过控制反馈帧实时更新，不需要额外读取
+-- 定期更新电机位置状态（仅查询在线的静止电机）
+-- 注意：运动中的电机通过控制反馈帧实时更新，但仍需定期读取以确保数据同步
 sys.timerLoopStart(function()
     for i, can_id in ipairs(MOTOR_CAN_IDS) do
         local state = dm_motor.get_state(can_id)
-        -- 只对使能状态的静止电机定期读取位置
-        if state and state.enabled then
+        -- 只查询在线的静止电机（online=true 且 velocity<0.01）
+        if state and state.online then
             -- 静止状态（速度接近0）才读取，运动中的电机由控制反馈帧更新
             if math.abs(state.velocity) < 0.01 then
                 dm_motor.read_register(can_id, 0x50)
