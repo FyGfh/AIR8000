@@ -60,6 +60,8 @@ local REGISTER_TYPES = {
     [0x16] = {name = "VMAX", type = "float", desc = "速度映射范围", unit = "rad/s"},
     [0x17] = {name = "TMAX", type = "float", desc = "扭矩映射范围", unit = "Nm"},
     [0x50] = {name = "p_m", type = "float", desc = "电机当前位置", unit = "rad"},
+    [0x51] = {name = "v_m", type = "float", desc = "电机当前速度", unit = "rad/s"},
+    [0x52] = {name = "t_m", type = "float", desc = "电机当前扭矩", unit = "Nm"},
 }
 
 local KP_MAX = 50
@@ -273,10 +275,24 @@ local function parse_register_data(motor, rid, d4, d5, d6, d7)
         motor.vmax = value
     elseif rid == 0x17 then
         motor.tmax = value
+    elseif rid == 0x50 then
+        -- 位置寄存器反馈
+        motor.position = value
+        log.info("dm_motor", string.format("电机0x%02X 位置寄存器反馈: %.2f rad", motor.can_id, value))
+    elseif rid == 0x51 then
+        -- 速度寄存器反馈
+        motor.velocity = value
+        log.info("dm_motor", string.format("电机0x%02X 速度寄存器反馈: %.2f rad/s", motor.can_id, value))
+    elseif rid == 0x52 then
+        -- 扭矩寄存器反馈
+        motor.torque = value
+        log.info("dm_motor", string.format("电机0x%02X 扭矩寄存器反馈: %.2f Nm", motor.can_id, value))
     end
 
-    log.info("dm_motor", string.format("电机0x%02X 寄存器0x%02X=%s",
-        motor.can_id, rid, tostring(value)))
+    if rid ~= 0x50 and rid ~= 0x51 and rid ~= 0x52 then
+        log.info("dm_motor", string.format("电机0x%02X 寄存器0x%02X=%s",
+            motor.can_id, rid, tostring(value)))
+    end
 
     return true
 end
@@ -288,26 +304,53 @@ local function can_callback(can_id, type, param)
             local succ, msg_id, msg_type, rtr, data = can.rx(can_id)
             if not succ then break end
 
-            if #data == 8 then
-                local can_id_l = string.byte(data, 1)
-                local can_id_h = string.byte(data, 2)
-                local flag = string.byte(data, 3)
+            log.debug("can_rx", string.format("收到CAN帧: msg_id=0x%03X, len=%d, data=%s",
+                msg_id, #data, data:toHex()))
 
-                -- 查找对应的电机
-                local motor_can_id = bit.band(can_id_l, 0x0F)  -- 提取低4位作为电机ID
+            if #data == 8 then
+                local motor_can_id = nil
+                local is_register_frame = false
+
+                -- 先检查数据格式判断是否为寄存器帧
+                local flag = string.byte(data, 3)
+                if flag == 0x33 or flag == 0x55 then
+                    -- 寄存器读写反馈帧
+                    -- 格式：[电机ID_L][电机ID_H][flag][寄存器ID][数据4字节]
+                    local can_id_l = string.byte(data, 1)
+                    local can_id_h = string.byte(data, 2)
+                    motor_can_id = bit.bor(can_id_l, bit.lshift(can_id_h, 8))
+                    is_register_frame = true
+                    log.debug("can_rx", string.format("寄存器帧: motor_id=0x%02X, flag=0x%02X, rid=0x%02X",
+                        motor_can_id, flag, string.byte(data, 4)))
+                else
+                    -- 控制反馈帧：格式 [MST_ID][ID|ERR<<4][POS_H][POS_L][VEL...][T...][T_MOS][T_Rotor]
+                    -- 从D[1]的低4位提取电机ID
+                    local id_err = string.byte(data, 2)
+                    motor_can_id = bit.band(id_err, 0x0F)  -- 低4位是电机ID
+                    is_register_frame = false
+                    log.debug("can_rx", string.format("控制反馈帧: motor_id=0x%02X, msg_id=0x%03X",
+                        motor_can_id, msg_id))
+                end
+
                 local motor = motors[motor_can_id]
 
                 if motor then
-                    if flag == 0x33 then  -- 寄存器读取
-                        local rid = string.byte(data, 4)
-                        parse_register_data(motor, rid,
-                            string.byte(data, 5), string.byte(data, 6),
-                            string.byte(data, 7), string.byte(data, 8))
-                    elseif flag == 0x55 then  -- 寄存器写入
-                        log.debug("dm_motor", string.format("电机0x%02X 写入成功", motor_can_id))
-                    else  -- 状态反馈
+                    if is_register_frame then
+                        -- 寄存器读写反馈
+                        if flag == 0x33 then  -- 寄存器读取
+                            local rid = string.byte(data, 4)
+                            parse_register_data(motor, rid,
+                                string.byte(data, 5), string.byte(data, 6),
+                                string.byte(data, 7), string.byte(data, 8))
+                        elseif flag == 0x55 then  -- 寄存器写入
+                            log.debug("dm_motor", string.format("电机0x%02X 写入成功", motor_can_id))
+                        end
+                    else
+                        -- 控制反馈帧：解析位置、速度、扭矩等状态
                         parse_feedback_frame(motor, data)
                     end
+                else
+                    log.debug("dm_motor", string.format("收到未注册电机的反馈: CAN ID=0x%02X, msg_id=0x%03X", motor_can_id or 0, msg_id))
                 end
             end
         end
@@ -337,11 +380,13 @@ function dm_motor.can_init()
         return false
     end
 
-    can.node(0, 0x011, can.STD)
-    can.mode(0, can.MODE_NORMAL)
+    -- 配置CAN接收过滤器 - 接收所有标准帧
+    -- 达妙电机反馈帧: 0x7FF(寄存器), 0x001-0x00F(MIT), 0x101-0x10F(位置速度), 0x201-0x20F(速度)
+    can.filter(CAN_ID, 0, can.STD, 0x000, 0x000)  -- 接收所有标准帧 (掩码为0表示不过滤)
+    can.mode(CAN_ID, can.MODE_NORMAL)
     can.on(CAN_ID, can_callback)
 
-    log.info("dm_motor", "CAN初始化完成 波特率:1Mbps")
+    log.info("dm_motor", "CAN初始化完成 波特率:1Mbps, 接收过滤器:接收所有标准帧")
     return true
 end
 

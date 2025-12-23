@@ -272,13 +272,20 @@ usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
         local motor_id = data:byte(1)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
+
+            -- 主动读取电机位置寄存器 (0x50)
+            dm_motor.read_register(can_id, 0x50)
+
+            -- 等待 CAN 响应 (100ms)
+            sys.wait(100)
+
             local state = dm_motor.get_state(can_id)
 
             if state then
                 -- 构造响应: [motor_id u8][position f32 大端序]
                 local pos_bytes = string.pack(">f", state.position)
                 local resp_data = string.char(motor_id) .. pos_bytes
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.2f rad", motor_id, can_id, state.position))
+                log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.4f rad (%.2f°)", motor_id, can_id, state.position, math.deg(state.position)))
                 return RESULT.RESPONSE, resp_data
             else
                 log.error("motor", string.format("电机%d (CAN:0x%02X) 状态查询失败", motor_id, can_id))
