@@ -9,8 +9,8 @@
 2. USB 虚拟串口 - V1.0帧协议命令控制和状态查询
 ]]
 
-PROJECT = "VDM_AIR8000_V1"
-VERSION = "000.200.000"
+PROJECT = "VDM_AIR8000"
+VERSION = "000.300.000"
 
 sys = require "sys"
 
