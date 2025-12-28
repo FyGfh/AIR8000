@@ -474,19 +474,9 @@ usb_vuart.on_cmd(CMD.MOTOR_READ_REG, function(seq, data)
 
                 if success then
                     local state = dm_motor.get_state(can_id)
-                    if state then
-                        -- 根据寄存器类型返回对应的值
-                        local value = 0
-                        if reg_id == 0x50 then
-                            value = state.position
-                        elseif reg_id == 0x51 then
-                            value = state.velocity
-                        elseif reg_id == 0x52 then
-                            value = state.torque
-                        else
-                            -- 其他寄存器暂时返回0，后续可扩展
-                            value = 0
-                        end
+                    if state and state.last_reg_id == reg_id and state.last_reg_value ~= nil then
+                        -- 使用最近读取的寄存器值
+                        local value = state.last_reg_value
 
                         -- 响应格式: [motor_id][reg_id][value f32 大端序]
                         local value_bytes = string.pack(">f", value)

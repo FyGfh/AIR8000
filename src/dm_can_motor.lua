@@ -159,6 +159,8 @@ local function create_motor(can_id)
         enabled = false,           -- 使能状态
         online = false,            -- 在线状态（是否有CAN响应）
         response_counter = 0,      -- 响应计数器（每次收到CAN响应时递增）
+        last_reg_id = nil,         -- 最近读取的寄存器ID
+        last_reg_value = nil,      -- 最近读取的寄存器值
     }
 end
 
@@ -338,6 +340,10 @@ local function parse_register_data(motor, rid, d4, d5, d6, d7)
     -- 标记电机在线
     motor.online = true
     motor.response_counter = motor.response_counter + 1  -- 响应计数器递增
+
+    -- 保存最近读取的寄存器值（用于通用寄存器读取）
+    motor.last_reg_id = rid
+    motor.last_reg_value = value
 
     -- 更新电机参数
     if rid == 0x07 then
@@ -661,7 +667,9 @@ function dm_motor.get_state(motor_can_id)
         mode = motor.mode,
         enabled = motor.enabled,
         online = motor.online,
-        response_counter = motor.response_counter
+        response_counter = motor.response_counter,
+        last_reg_id = motor.last_reg_id,
+        last_reg_value = motor.last_reg_value
     }
 end
 
