@@ -452,6 +452,204 @@ usb_vuart.on_cmd(CMD.MOTOR_ROTATE_REL, function(seq, data)
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
+-- ==================== 6.1 电机参数命令 (0x31xx) ====================
+
+-- 读取电机寄存器 (0x3101)
+-- 数据格式: [motor_id u8][reg_id u8]
+-- 响应格式: [motor_id u8][reg_id u8][value f32/u32 大端序]
+usb_vuart.on_cmd(CMD.MOTOR_READ_REG, function(seq, data)
+    if #data >= 2 then
+        local motor_id = data:byte(1)
+        local reg_id = data:byte(2)
+
+        if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
+            local can_id = MOTOR_CAN_IDS[motor_id]
+
+            sys.taskInit(function()
+                -- 发送读取寄存器命令
+                dm_motor.read_register(can_id, reg_id)
+
+                -- 等待电机响应
+                local success = dm_motor.wait_response(can_id, 300)
+
+                if success then
+                    local state = dm_motor.get_state(can_id)
+                    if state then
+                        -- 根据寄存器类型返回对应的值
+                        local value = 0
+                        if reg_id == 0x50 then
+                            value = state.position
+                        elseif reg_id == 0x51 then
+                            value = state.velocity
+                        elseif reg_id == 0x52 then
+                            value = state.torque
+                        else
+                            -- 其他寄存器暂时返回0，后续可扩展
+                            value = 0
+                        end
+
+                        -- 响应格式: [motor_id][reg_id][value f32 大端序]
+                        local value_bytes = string.pack(">f", value)
+                        local resp_data = string.char(motor_id, reg_id) .. value_bytes
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 读取寄存器0x%02X = %.4f",
+                            motor_id, can_id, reg_id, value))
+                        usb_vuart.send_response(seq, CMD.MOTOR_READ_REG, resp_data)
+                        return
+                    end
+                end
+
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 读取寄存器0x%02X失败", motor_id, can_id, reg_id))
+                usb_vuart.send_nack(seq, CMD.MOTOR_READ_REG, ERROR.TIMEOUT)
+            end)
+            return RESULT.NONE
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 写入电机寄存器 (0x3102)
+-- 数据格式: [motor_id u8][reg_id u8][value f32/u32 大端序]
+-- 响应格式: [motor_id u8][reg_id u8]
+-- 注意: 写入寄存器需要电机处于失能状态
+usb_vuart.on_cmd(CMD.MOTOR_WRITE_REG, function(seq, data)
+    if #data >= 6 then
+        local motor_id = data:byte(1)
+        local reg_id = data:byte(2)
+        local value = string.unpack(">f", data:sub(3, 6))
+
+        if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
+            local can_id = MOTOR_CAN_IDS[motor_id]
+
+            sys.taskInit(function()
+                -- 写入寄存器（使用float类型）
+                local success = dm_motor.write_register(can_id, reg_id, value, true)
+
+                if success then
+                    -- 等待写入确认
+                    local confirmed = dm_motor.wait_response(can_id, 300)
+                    if confirmed then
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 写入寄存器0x%02X = %.4f",
+                            motor_id, can_id, reg_id, value))
+                        usb_vuart.send_response(seq, CMD.MOTOR_WRITE_REG, string.char(motor_id, reg_id))
+                        return
+                    end
+                end
+
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 写入寄存器0x%02X失败", motor_id, can_id, reg_id))
+                usb_vuart.send_nack(seq, CMD.MOTOR_WRITE_REG, ERROR.TIMEOUT)
+            end)
+            return RESULT.NONE
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 保存参数到Flash (0x3103)
+-- 数据格式: [motor_id u8]
+-- 响应格式: [motor_id u8]
+-- 注意: 必须在失能状态下执行
+usb_vuart.on_cmd(CMD.MOTOR_SAVE_FLASH, function(seq, data)
+    if #data >= 1 then
+        local motor_id = data:byte(1)
+
+        if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
+            local can_id = MOTOR_CAN_IDS[motor_id]
+
+            sys.taskInit(function()
+                -- 保存参数到Flash
+                local success = dm_motor.save_param_to_flash(can_id)
+
+                if success then
+                    sys.wait(200)  -- 等待Flash写入完成
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 参数已保存到Flash", motor_id, can_id))
+                    usb_vuart.send_response(seq, CMD.MOTOR_SAVE_FLASH, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 保存Flash失败", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_SAVE_FLASH, ERROR.EXEC_FAILED)
+                end
+            end)
+            return RESULT.NONE
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 刷新电机状态 (0x3104)
+-- 数据格式: [motor_id u8]
+-- 响应格式: [motor_id u8][position f32][velocity f32][torque f32][temp_mos u8][temp_rotor u8][error u8][enabled u8]
+usb_vuart.on_cmd(CMD.MOTOR_REFRESH, function(seq, data)
+    if #data >= 1 then
+        local motor_id = data:byte(1)
+
+        if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
+            local can_id = MOTOR_CAN_IDS[motor_id]
+
+            sys.taskInit(function()
+                -- 刷新电机状态
+                local success = dm_motor.refresh_status_confirmed(can_id, 300)
+
+                if success then
+                    local state = dm_motor.get_state(can_id)
+                    if state then
+                        -- 打包完整状态数据
+                        local resp_data = string.char(motor_id) ..
+                            string.pack(">f", state.position) ..
+                            string.pack(">f", state.velocity) ..
+                            string.pack(">f", state.torque) ..
+                            string.char(
+                                state.temperature_mos,
+                                state.temperature_rotor,
+                                state.error_code,
+                                state.enabled and 1 or 0
+                            )
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 状态刷新: pos=%.2f vel=%.2f err=0x%X",
+                            motor_id, can_id, state.position, state.velocity, state.error_code))
+                        usb_vuart.send_response(seq, CMD.MOTOR_REFRESH, resp_data)
+                        return
+                    end
+                end
+
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 状态刷新失败", motor_id, can_id))
+                usb_vuart.send_nack(seq, CMD.MOTOR_REFRESH, ERROR.TIMEOUT)
+            end)
+            return RESULT.NONE
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 清除电机错误 (0x3105)
+-- 数据格式: [motor_id u8]
+-- 响应格式: [motor_id u8]
+usb_vuart.on_cmd(CMD.MOTOR_CLEAR_ERROR, function(seq, data)
+    if #data >= 1 then
+        local motor_id = data:byte(1)
+
+        if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
+            local can_id = MOTOR_CAN_IDS[motor_id]
+
+            sys.taskInit(function()
+                -- 清除错误（使用MIT模式）
+                local success = dm_motor.clear_error(can_id)
+
+                if success then
+                    local confirmed = dm_motor.wait_response(can_id, 300)
+                    if confirmed then
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 错误已清除", motor_id, can_id))
+                        usb_vuart.send_response(seq, CMD.MOTOR_CLEAR_ERROR, string.char(motor_id))
+                        return
+                    end
+                end
+
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 清除错误失败", motor_id, can_id))
+                usb_vuart.send_nack(seq, CMD.MOTOR_CLEAR_ERROR, ERROR.EXEC_FAILED)
+            end)
+            return RESULT.NONE
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
 -- ==================== 7. 设备控制命令 ====================
 
 -- LED控制 (0x5003)

@@ -100,6 +100,7 @@ CMD = [GROUP (8bit)] [ID (8bit)]
 | 0x00 | 0x0000-0x00FF | SYSTEM | 系统命令 |
 | 0x01 | 0x0100-0x01FF | QUERY | 查询命令 |
 | 0x30 | 0x3000-0x30FF | MOTOR | 电机控制 |
+| 0x31 | 0x3100-0x31FF | MOTOR_PARAM | 电机参数读写 |
 | 0x40 | 0x4000-0x40FF | SENSOR | 传感器 |
 | 0x50 | 0x5000-0x50FF | DEVICE | 设备控制 |
 | 0x60 | 0x6000-0x60FF | CONFIG | 配置管理 |
@@ -167,6 +168,95 @@ AA 55 30 01 02 30 06 00 05 01 42B40000 [CRC]
          │  └──────────────────── SEQ=02 (匹配请求)
          └─────────────────────── TYPE=RESPONSE
 ```
+
+---
+
+## 0x31 电机参数命令组
+
+用于读写DM电机内部寄存器参数，支持参数持久化。
+
+### 命令列表
+
+| CMD | 名称 | DATA格式 | 响应格式 | 说明 |
+|-----|------|----------|----------|------|
+| 0x3101 | MOTOR_READ_REG | [motor_id u8][reg_id u8] | [motor_id u8][reg_id u8][value f32] | 读取寄存器 |
+| 0x3102 | MOTOR_WRITE_REG | [motor_id u8][reg_id u8][value f32] | [motor_id u8][reg_id u8] | 写入寄存器 |
+| 0x3103 | MOTOR_SAVE_FLASH | [motor_id u8] | [motor_id u8] | 保存参数到Flash |
+| 0x3104 | MOTOR_REFRESH | [motor_id u8] | [motor_id u8][pos f32][vel f32][torque f32][temp_mos u8][temp_rotor u8][error u8][enabled u8] | 刷新电机状态 |
+| 0x3105 | MOTOR_CLEAR_ERROR | [motor_id u8] | [motor_id u8] | 清除电机错误 |
+
+### 寄存器地址表
+
+| 地址 | 名称 | 类型 | 读写 | 说明 |
+|------|------|------|------|------|
+| 0x00 | UV_Value | float | RW | 低压保护值 |
+| 0x01 | KT_Value | float | RW | 扭矩系数 |
+| 0x02 | OT_Value | float | RW | 过温保护值 |
+| 0x03 | OC_Value | float | RW | 过流保护值 |
+| 0x04 | ACC | float | RW | 加速度 |
+| 0x05 | DEC | float | RW | 减速度 |
+| 0x06 | MAX_SPD | float | RW | 最大速度 |
+| 0x07 | MST_ID | u32 | RW | 反馈ID (Master ID) |
+| 0x08 | ESC_ID | u32 | RW | 接收ID (Slave ID) |
+| 0x09 | TIMEOUT | u32 | RW | 超时警报时间 |
+| 0x0A | CTRL_MODE | u32 | RW | 控制模式 |
+| 0x15 | PMAX | float | RW | 位置映射范围 (rad) |
+| 0x16 | VMAX | float | RW | 速度映射范围 (rad/s) |
+| 0x17 | TMAX | float | RW | 扭矩映射范围 (Nm) |
+| 0x18 | I_BW | float | RW | 电流环控制带宽 |
+| 0x19 | KP_ASR | float | RW | 速度环Kp |
+| 0x1A | KI_ASR | float | RW | 速度环Ki |
+| 0x1B | KP_APR | float | RW | 位置环Kp |
+| 0x1C | KI_APR | float | RW | 位置环Ki |
+| 0x1D | OV_Value | float | RW | 过压保护值 |
+| 0x50 | p_m | float | RO | 电机当前位置 (rad) |
+| 0x51 | v_m | float | RO | 电机当前速度 (rad/s) |
+| 0x52 | t_m | float | RO | 电机当前扭矩 (Nm) |
+
+### 示例：读取电机1的位置环Kp
+
+```
+请求帧:
+  CMD    = 31 01 (MOTOR_READ_REG)
+  LEN    = 00 02 (2字节)
+  DATA   = 01 1B
+           │  └─ reg_id=0x1B (KP_APR)
+           └───── motor_id=1
+
+完整帧:
+AA 55 10 00 01 31 01 00 02 01 1B [CRC_H] [CRC_L]
+
+响应帧:
+AA 55 10 01 01 31 01 00 06 01 1B 41200000 [CRC]
+                              │  │  └─ value=10.0 (f32大端序)
+                              │  └───── reg_id=0x1B
+                              └──────── motor_id=1
+```
+
+### 示例：设置电机1的位置环Kp为15.0
+
+```
+请求帧:
+  CMD    = 31 02 (MOTOR_WRITE_REG)
+  LEN    = 00 06 (6字节)
+  DATA   = 01 1B 41700000
+           │  │  └─ value=15.0 (f32大端序)
+           │  └───── reg_id=0x1B (KP_APR)
+           └──────── motor_id=1
+
+完整帧:
+AA 55 10 00 01 31 02 00 06 01 1B 41 70 00 00 [CRC_H] [CRC_L]
+
+响应帧 (成功):
+AA 55 10 01 01 31 02 00 02 01 1B [CRC]
+```
+
+### 注意事项
+
+1. **写入寄存器前必须先失能电机**
+2. **写入后需调用 0x3103 保存到Flash才能掉电保存**
+3. **寄存器值使用大端序 f32 格式**
+4. **只读寄存器(RO)写入会失败**
 
 ---
 
@@ -458,7 +548,13 @@ AA 55 [VER] [TYPE] [SEQ] [CMD_H CMD_L] [LEN_H LEN_L] [DATA...] [CRC_H CRC_L]
 | 0x3001 | MOTOR_ROTATE |
 | 0x3002 | MOTOR_ENABLE |
 | 0x3006 | MOTOR_GET_POS |
+| 0x3101 | MOTOR_READ_REG |
+| 0x3102 | MOTOR_WRITE_REG |
+| 0x3103 | MOTOR_SAVE_FLASH |
+| 0x3104 | MOTOR_REFRESH |
+| 0x3105 | MOTOR_CLEAR_ERROR |
 | 0x4001 | SENSOR_READ_TEMP |
 | 0x5001 | DEV_HEATER |
+| 0x5006 | DEV_MOTOR_POWER |
 
 ---

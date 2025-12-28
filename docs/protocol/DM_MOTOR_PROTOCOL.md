@@ -370,10 +370,256 @@ end)
 
 ## 版本信息
 
-- **文档版本**: v2.0
-- **日期**: 2025.12.13
+- **文档版本**: v1.2
+- **协议版本**: V1.0
+- **日期**: 2025.12.28
 - **适用电机**: DM系列CAN总线伺服电机
 - **更新内容**:
-  - ✅ 支持多电机控制
-  - ✅ 所有命令增加电机ID参数
-  - ✅ 新增多电机控制示例
+  - v1.0: 初始版本，支持多电机控制
+  - v1.1: 所有命令增加电机ID参数，新增多电机控制示例
+  - v1.2: 新增电机参数读写命令 (0x31xx)，新增寄存器地址表
+
+---
+
+## V1.0协议电机参数命令 (0x31xx)
+
+本节描述使用V1.0帧协议的电机参数读写命令。
+
+### 命令列表
+
+| CMD | 名称 | DATA格式 | 响应格式 | 说明 |
+|-----|------|----------|----------|------|
+| 0x3101 | MOTOR_READ_REG | [motor_id u8][reg_id u8] | [motor_id u8][reg_id u8][value f32] | 读取寄存器 |
+| 0x3102 | MOTOR_WRITE_REG | [motor_id u8][reg_id u8][value f32 大端序] | [motor_id u8][reg_id u8] | 写入寄存器 |
+| 0x3103 | MOTOR_SAVE_FLASH | [motor_id u8] | [motor_id u8] | 保存参数到Flash |
+| 0x3104 | MOTOR_REFRESH | [motor_id u8] | 见下文 | 刷新电机状态 |
+| 0x3105 | MOTOR_CLEAR_ERROR | [motor_id u8] | [motor_id u8] | 清除电机错误 |
+
+### 6. 读取电机寄存器 (0x3101)
+
+**方向**: Hi3516cv610 → Air8000
+
+**请求数据格式**:
+```
+┌──────────┬──────────┐
+│ 电机ID   │ 寄存器ID  │
+│  (1B)    │  (1B)    │
+└──────────┴──────────┘
+总长度: 2字节
+```
+
+**响应数据格式**:
+```
+┌──────────┬──────────┬──────────┐
+│ 电机ID   │ 寄存器ID  │ 值(4B)   │
+│  (1B)    │  (1B)    │  f32     │
+└──────────┴──────────┴──────────┘
+总长度: 6字节
+```
+
+**示例（C）**:
+```c
+// 读取电机1的位置环Kp (寄存器0x1B)
+uint8_t request[13];
+request[0] = 0xAA;  // SYNC1
+request[1] = 0x55;  // SYNC2
+request[2] = 0x10;  // VER
+request[3] = 0x00;  // TYPE=REQUEST
+request[4] = seq++; // SEQ
+request[5] = 0x31;  // CMD_H
+request[6] = 0x01;  // CMD_L (MOTOR_READ_REG)
+request[7] = 0x00;  // LEN_H
+request[8] = 0x02;  // LEN_L
+request[9] = 0x01;  // motor_id=1
+request[10] = 0x1B; // reg_id=KP_APR
+// 计算并添加CRC
+uint16_t crc = crc16_modbus(&request[2], 9);
+request[11] = (crc >> 8) & 0xFF;
+request[12] = crc & 0xFF;
+
+write(uart_fd, request, 13);
+```
+
+---
+
+### 7. 写入电机寄存器 (0x3102)
+
+**方向**: Hi3516cv610 → Air8000
+
+**请求数据格式**:
+```
+┌──────────┬──────────┬──────────┐
+│ 电机ID   │ 寄存器ID  │ 值(4B)   │
+│  (1B)    │  (1B)    │f32 大端序│
+└──────────┴──────────┴──────────┘
+总长度: 6字节
+```
+
+**响应数据格式**:
+```
+┌──────────┬──────────┐
+│ 电机ID   │ 寄存器ID  │
+│  (1B)    │  (1B)    │
+└──────────┴──────────┘
+总长度: 2字节
+```
+
+**示例（C）**:
+```c
+// 设置电机1的位置环Kp为15.0
+uint8_t request[17];
+request[0] = 0xAA;  // SYNC1
+request[1] = 0x55;  // SYNC2
+request[2] = 0x10;  // VER
+request[3] = 0x00;  // TYPE=REQUEST
+request[4] = seq++; // SEQ
+request[5] = 0x31;  // CMD_H
+request[6] = 0x02;  // CMD_L (MOTOR_WRITE_REG)
+request[7] = 0x00;  // LEN_H
+request[8] = 0x06;  // LEN_L
+request[9] = 0x01;  // motor_id=1
+request[10] = 0x1B; // reg_id=KP_APR
+
+// 15.0的IEEE754表示 (大端序): 0x41700000
+float value = 15.0f;
+uint32_t value_bits = *(uint32_t*)&value;
+request[11] = (value_bits >> 24) & 0xFF;
+request[12] = (value_bits >> 16) & 0xFF;
+request[13] = (value_bits >> 8) & 0xFF;
+request[14] = value_bits & 0xFF;
+
+// 计算并添加CRC
+uint16_t crc = crc16_modbus(&request[2], 13);
+request[15] = (crc >> 8) & 0xFF;
+request[16] = crc & 0xFF;
+
+write(uart_fd, request, 17);
+```
+
+**注意**: 写入寄存器前必须先失能电机！
+
+---
+
+### 8. 保存参数到Flash (0x3103)
+
+**方向**: Hi3516cv610 → Air8000
+
+**请求数据格式**:
+```
+┌──────────┐
+│ 电机ID   │
+│  (1B)    │
+└──────────┘
+总长度: 1字节
+```
+
+**响应数据格式**: 同请求
+
+**说明**: 将当前寄存器参数保存到电机Flash，掉电后仍然有效。
+
+---
+
+### 9. 刷新电机状态 (0x3104)
+
+**方向**: Hi3516cv610 → Air8000
+
+**请求数据格式**:
+```
+┌──────────┐
+│ 电机ID   │
+│  (1B)    │
+└──────────┘
+总长度: 1字节
+```
+
+**响应数据格式**:
+```
+┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ 电机ID   │位置(4B)  │速度(4B)  │扭矩(4B)  │MOS温度   │转子温度  │错误码    │使能状态  │
+│  (1B)    │f32 大端  │f32 大端  │f32 大端  │  (1B)    │  (1B)    │  (1B)    │  (1B)    │
+└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+总长度: 17字节
+```
+
+**说明**: 主动请求电机返回当前状态，用于在不发送控制命令时获取实时状态。
+
+---
+
+### 10. 清除电机错误 (0x3105)
+
+**方向**: Hi3516cv610 → Air8000
+
+**请求数据格式**:
+```
+┌──────────┐
+│ 电机ID   │
+│  (1B)    │
+└──────────┘
+总长度: 1字节
+```
+
+**响应数据格式**: 同请求
+
+**说明**: 清除电机的错误状态，使电机可以重新使能。
+
+---
+
+## 常用寄存器地址表
+
+| 地址 | 名称 | 类型 | 读写 | 说明 |
+|------|------|------|------|------|
+| 0x00 | UV_Value | float | RW | 低压保护值 |
+| 0x01 | KT_Value | float | RW | 扭矩系数 |
+| 0x02 | OT_Value | float | RW | 过温保护值 |
+| 0x03 | OC_Value | float | RW | 过流保护值 |
+| 0x04 | ACC | float | RW | 加速度 |
+| 0x05 | DEC | float | RW | 减速度 |
+| 0x06 | MAX_SPD | float | RW | 最大速度 |
+| 0x07 | MST_ID | u32 | RW | 反馈ID (Master ID) |
+| 0x08 | ESC_ID | u32 | RW | 接收ID (Slave ID) |
+| 0x09 | TIMEOUT | u32 | RW | 超时警报时间 |
+| 0x0A | CTRL_MODE | u32 | RW | 控制模式 |
+| 0x15 | PMAX | float | RW | 位置映射范围 (rad) |
+| 0x16 | VMAX | float | RW | 速度映射范围 (rad/s) |
+| 0x17 | TMAX | float | RW | 扭矩映射范围 (Nm) |
+| 0x18 | I_BW | float | RW | 电流环控制带宽 |
+| 0x19 | KP_ASR | float | RW | 速度环Kp |
+| 0x1A | KI_ASR | float | RW | 速度环Ki |
+| 0x1B | KP_APR | float | RW | 位置环Kp |
+| 0x1C | KI_APR | float | RW | 位置环Ki |
+| 0x1D | OV_Value | float | RW | 过压保护值 |
+| 0x50 | p_m | float | RO | 电机当前位置 (rad) |
+| 0x51 | v_m | float | RO | 电机当前速度 (rad/s) |
+| 0x52 | t_m | float | RO | 电机当前扭矩 (Nm) |
+
+---
+
+## 参数设置流程示例
+
+以下是完整的参数设置流程：
+
+```c
+// 1. 失能电机
+send_motor_disable(motor_id);
+usleep(100000);
+
+// 2. 设置位置环Kp
+send_motor_write_reg(motor_id, 0x1B, 15.0f);
+usleep(50000);
+
+// 3. 设置速度环Kp
+send_motor_write_reg(motor_id, 0x19, 5.0f);
+usleep(50000);
+
+// 4. 保存参数到Flash (可选，用于掉电保存)
+send_motor_save_flash(motor_id);
+usleep(200000);
+
+// 5. 重新使能电机
+send_motor_enable(motor_id, 2);  // 模式2=位置速度模式
+usleep(100000);
+
+// 6. 读取验证参数
+float kp_apr = read_motor_reg(motor_id, 0x1B);
+printf("KP_APR = %.2f\n", kp_apr);
+```

@@ -62,6 +62,13 @@ usb_vuart.CMD = {
     MOTOR_ROTATE_REL = 0x3008,
     MOTOR_GET_ALL    = 0x3010,
 
+    -- 电机参数命令 (0x31xx)
+    MOTOR_READ_REG     = 0x3101,  -- 读取电机寄存器
+    MOTOR_WRITE_REG    = 0x3102,  -- 写入电机寄存器
+    MOTOR_SAVE_FLASH   = 0x3103,  -- 保存参数到Flash
+    MOTOR_REFRESH      = 0x3104,  -- 刷新电机状态
+    MOTOR_CLEAR_ERROR  = 0x3105,  -- 清除电机错误
+
     -- 传感器命令 (0x40xx)
     SENSOR_READ_TEMP = 0x4001,
     SENSOR_READ_ALL  = 0x4002,
