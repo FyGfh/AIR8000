@@ -476,6 +476,16 @@ function usb_vuart.send_ack(seq, cmd)
     return true
 end
 
+-- 发送NACK (用于异步响应失败)
+function usb_vuart.send_nack(seq, cmd, error_code)
+    if not is_initialized then
+        return false
+    end
+    local nack = build_nack(seq, cmd, error_code or 0x05)
+    uart.write(UART_ID, nack)
+    return true
+end
+
 -- ==================== 导出构造函数 ====================
 usb_vuart.build_frame = build_frame
 usb_vuart.build_response = build_response

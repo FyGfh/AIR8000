@@ -86,14 +86,14 @@ end
 -- enabled: true=使能, false=失能
 -- mode: 控制模式 (1=MIT, 2=位置速度, 3=速度)
 function dm_motor_bridge.enable(motor_can_id, enabled, mode)
-    mode = mode or 1  -- 默认MIT模式
+    mode = mode or 2  -- 默认MIT模式
     local cmd_type = enabled and "enable" or "disable"
     return dm_can.send_mode_command(motor_can_id, mode, cmd_type)
 end
 
--- 保存零点（使用MIT模式）
-function dm_motor_bridge.save_zero(motor_can_id)
-    return dm_can.send_mode_command(motor_can_id, 1, "save_zero")  -- 使用MIT模式
+-- 保存零点 (固定使用位置速度模式)
+function dm_motor_bridge.save_zero_with_mode(motor_can_id, mode)
+    return dm_can.send_mode_command(motor_can_id, mode, "save_zero")
 end
 
 -- 清除错误（使用MIT模式）
@@ -114,6 +114,75 @@ end
 -- 获取电机状态
 function dm_motor_bridge.get_state(motor_can_id)
     return dm_can.get_state(motor_can_id)
+end
+
+-- 等待电机响应
+function dm_motor_bridge.wait_response(motor_can_id, timeout_ms)
+    return dm_can.wait_response(motor_can_id, timeout_ms)
+end
+
+-- 检查电机是否在线
+function dm_motor_bridge.is_online(motor_can_id)
+    return dm_can.is_online(motor_can_id)
+end
+
+-- 发送命令并等待确认
+function dm_motor_bridge.send_and_wait(motor_can_id, send_func, timeout_ms)
+    return dm_can.send_and_wait(motor_can_id, send_func, timeout_ms)
+end
+
+-- ==================== 带确认的控制函数 ====================
+
+-- 位置速度模式控制（带响应确认）
+-- 返回: true=电机确认执行, false=超时无响应
+function dm_motor_bridge.pos_control_confirmed(motor_can_id, p_des, v_des, timeout_ms)
+    return dm_can.send_and_wait(motor_can_id, function()
+        return dm_can.pos_control(motor_can_id, p_des, v_des)
+    end, timeout_ms or 200)
+end
+
+-- 速度模式控制（带响应确认）
+function dm_motor_bridge.vel_control_confirmed(motor_can_id, v_des, timeout_ms)
+    return dm_can.send_and_wait(motor_can_id, function()
+        return dm_can.vel_control(motor_can_id, v_des)
+    end, timeout_ms or 200)
+end
+
+-- 电机使能（带响应确认）
+function dm_motor_bridge.enable_confirmed(motor_can_id, enabled, mode, timeout_ms)
+    mode = mode or 2
+    local cmd_type = enabled and "enable" or "disable"
+    return dm_can.send_and_wait(motor_can_id, function()
+        return dm_can.send_mode_command(motor_can_id, mode, cmd_type)
+    end, timeout_ms or 300)
+end
+
+-- 保存零点（带响应确认）
+function dm_motor_bridge.save_zero_confirmed(motor_can_id, mode, timeout_ms)
+    return dm_can.send_and_wait(motor_can_id, function()
+        return dm_can.send_mode_command(motor_can_id, mode, "save_zero")
+    end, timeout_ms or 500)
+end
+
+-- 保存参数到Flash（掉电保存）
+-- 注意：必须在失能状态下执行
+function dm_motor_bridge.save_param_to_flash(motor_can_id)
+    return dm_can.save_param_to_flash(motor_can_id)
+end
+
+-- 刷新电机状态（主动请求电机返回当前状态）
+function dm_motor_bridge.refresh_status(motor_can_id)
+    return dm_can.refresh_status(motor_can_id)
+end
+
+-- 刷新电机状态（带确认）
+function dm_motor_bridge.refresh_status_confirmed(motor_can_id, timeout_ms)
+    return dm_can.refresh_status_confirmed(motor_can_id, timeout_ms)
+end
+
+-- 获取寄存器地址映射表
+function dm_motor_bridge.get_reg_map()
+    return dm_can.REG
 end
 
 -- ==================== 打包电机状态数据 ====================

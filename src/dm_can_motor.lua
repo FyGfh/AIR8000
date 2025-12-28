@@ -52,16 +52,80 @@ local MODE_DEFINITIONS = {
     [3] = {name = "速度模式", can_base = 0x0200},
 }
 
--- 寄存器定义（简化版，完整定义见原文件）
+-- 寄存器定义（完整版 - 参考达妙MATLAB库）
+-- RW: 可读写, RO: 只读
 local REGISTER_TYPES = {
-    [0x07] = {name = "MST_ID", type = "uint32", desc = "反馈ID"},
-    [0x0A] = {name = "CTRL_MODE", type = "uint32", desc = "控制模式"},
-    [0x15] = {name = "PMAX", type = "float", desc = "位置映射范围", unit = "rad"},
-    [0x16] = {name = "VMAX", type = "float", desc = "速度映射范围", unit = "rad/s"},
-    [0x17] = {name = "TMAX", type = "float", desc = "扭矩映射范围", unit = "Nm"},
-    [0x50] = {name = "p_m", type = "float", desc = "电机当前位置", unit = "rad"},
-    [0x51] = {name = "v_m", type = "float", desc = "电机当前速度", unit = "rad/s"},
-    [0x52] = {name = "t_m", type = "float", desc = "电机当前扭矩", unit = "Nm"},
+    -- 保护参数 (0x00-0x03)
+    [0x00] = {name = "UV_Value", type = "float", desc = "低压保护值", rw = true},
+    [0x01] = {name = "KT_Value", type = "float", desc = "扭矩系数", rw = true},
+    [0x02] = {name = "OT_Value", type = "float", desc = "过温保护值", rw = true},
+    [0x03] = {name = "OC_Value", type = "float", desc = "过流保护值", rw = true},
+    -- 运动参数 (0x04-0x06)
+    [0x04] = {name = "ACC", type = "float", desc = "加速度", rw = true},
+    [0x05] = {name = "DEC", type = "float", desc = "减速度", rw = true},
+    [0x06] = {name = "MAX_SPD", type = "float", desc = "最大速度", rw = true},
+    -- ID配置 (0x07-0x08)
+    [0x07] = {name = "MST_ID", type = "uint32", desc = "反馈ID (Master ID)", rw = true},
+    [0x08] = {name = "ESC_ID", type = "uint32", desc = "接收ID (Slave ID)", rw = true},
+    -- 控制参数 (0x09-0x0A)
+    [0x09] = {name = "TIMEOUT", type = "uint32", desc = "超时警报时间", rw = true},
+    [0x0A] = {name = "CTRL_MODE", type = "uint32", desc = "控制模式", rw = true},
+    -- 电机物理参数 (0x0B-0x14) - 只读
+    [0x0B] = {name = "Damp", type = "float", desc = "电机粘滞系数", rw = false},
+    [0x0C] = {name = "Inertia", type = "float", desc = "电机转动惯量", rw = false},
+    [0x0D] = {name = "hw_ver", type = "uint32", desc = "硬件版本号", rw = false},
+    [0x0E] = {name = "sw_ver", type = "uint32", desc = "软件版本号", rw = false},
+    [0x0F] = {name = "SN", type = "uint32", desc = "序列号", rw = false},
+    [0x10] = {name = "NPP", type = "uint32", desc = "电机极对数", rw = false},
+    [0x11] = {name = "Rs", type = "float", desc = "电机相电阻", rw = false},
+    [0x12] = {name = "Ls", type = "float", desc = "电机相电感", rw = false},
+    [0x13] = {name = "Flux", type = "float", desc = "电机磁链值", rw = false},
+    [0x14] = {name = "Gr", type = "float", desc = "齿轮减速比", rw = false},
+    -- 映射范围 (0x15-0x17)
+    [0x15] = {name = "PMAX", type = "float", desc = "位置映射范围", unit = "rad", rw = true},
+    [0x16] = {name = "VMAX", type = "float", desc = "速度映射范围", unit = "rad/s", rw = true},
+    [0x17] = {name = "TMAX", type = "float", desc = "扭矩映射范围", unit = "Nm", rw = true},
+    -- 控制环参数 (0x18-0x22)
+    [0x18] = {name = "I_BW", type = "float", desc = "电流环控制带宽", rw = true},
+    [0x19] = {name = "KP_ASR", type = "float", desc = "速度环Kp", rw = true},
+    [0x1A] = {name = "KI_ASR", type = "float", desc = "速度环Ki", rw = true},
+    [0x1B] = {name = "KP_APR", type = "float", desc = "位置环Kp", rw = true},
+    [0x1C] = {name = "KI_APR", type = "float", desc = "位置环Ki", rw = true},
+    [0x1D] = {name = "OV_Value", type = "float", desc = "过压保护值", rw = true},
+    [0x1E] = {name = "GREF", type = "float", desc = "齿轮力矩效率", rw = true},
+    [0x1F] = {name = "Deta", type = "float", desc = "速度环阻尼系数", rw = true},
+    [0x20] = {name = "V_BW", type = "float", desc = "速度环滤波带宽", rw = true},
+    [0x21] = {name = "IQ_c1", type = "float", desc = "电流环增强系数", rw = true},
+    [0x22] = {name = "VL_c1", type = "float", desc = "速度环增强系数", rw = true},
+    -- CAN配置 (0x23)
+    [0x23] = {name = "can_br", type = "uint32", desc = "CAN波特率代码", rw = true},
+    -- 子版本 (0x24)
+    [0x24] = {name = "sub_ver", type = "uint32", desc = "子版本号", rw = false},
+    -- 校准参数 (0x32-0x37) - 只读
+    [0x32] = {name = "u_off", type = "float", desc = "u相偏置", rw = false},
+    [0x33] = {name = "v_off", type = "float", desc = "v相偏置", rw = false},
+    [0x34] = {name = "k1", type = "float", desc = "补偿因子1", rw = false},
+    [0x35] = {name = "k2", type = "float", desc = "补偿因子2", rw = false},
+    [0x36] = {name = "m_off", type = "float", desc = "角度偏移", rw = false},
+    [0x37] = {name = "dir", type = "float", desc = "方向", rw = false},
+    -- 实时状态 (0x50-0x52) - 只读
+    [0x50] = {name = "p_m", type = "float", desc = "电机当前位置", unit = "rad", rw = false},
+    [0x51] = {name = "xout", type = "float", desc = "输出轴位置", unit = "rad", rw = false},
+    [0x52] = {name = "t_m", type = "float", desc = "电机当前扭矩", unit = "Nm", rw = false},
+}
+
+-- 寄存器名称到地址的映射表
+dm_motor.REG = {
+    UV_Value = 0x00, KT_Value = 0x01, OT_Value = 0x02, OC_Value = 0x03,
+    ACC = 0x04, DEC = 0x05, MAX_SPD = 0x06,
+    MST_ID = 0x07, ESC_ID = 0x08, TIMEOUT = 0x09, CTRL_MODE = 0x0A,
+    Damp = 0x0B, Inertia = 0x0C, hw_ver = 0x0D, sw_ver = 0x0E,
+    SN = 0x0F, NPP = 0x10, Rs = 0x11, Ls = 0x12, Flux = 0x13, Gr = 0x14,
+    PMAX = 0x15, VMAX = 0x16, TMAX = 0x17,
+    I_BW = 0x18, KP_ASR = 0x19, KI_ASR = 0x1A, KP_APR = 0x1B, KI_APR = 0x1C,
+    OV_Value = 0x1D, GREF = 0x1E, Deta = 0x1F, V_BW = 0x20,
+    IQ_c1 = 0x21, VL_c1 = 0x22, can_br = 0x23, sub_ver = 0x24,
+    p_m = 0x50, v_m = 0x51, t_m = 0x52,
 }
 
 local KP_MAX = 50
@@ -196,9 +260,10 @@ end
 local function can_send(msg_id, id_type, RTR, need_ack, data)
     local result = can.tx(CAN_ID, msg_id, id_type, RTR, need_ack, data)
     if result == 0 then
-        log.debug("can.tx", string.format("发送成功 ID:0x%X Data:%s", msg_id, data:toHex()))
+        log.info("can.tx", string.format("✓ 发送成功 CAN_ID:0x%03X DLC:%d Data:[%s]",
+            msg_id, #data, data:toHex()))
     else
-        log.error("can.tx", string.format("发送失败 ID:0x%X result:%d", msg_id, result))
+        log.error("can.tx", string.format("✗ 发送失败 CAN_ID:0x%03X result:%d", msg_id, result))
     end
     return result == 0
 end
@@ -324,8 +389,8 @@ local function can_callback(can_id, type, param)
                 -- 先检查数据格式判断是否为寄存器帧
                 local flag = string.byte(data, 3)
                 if flag == 0x33 or flag == 0x55 then
-                    -- 寄存器读写反馈帧
-                    -- 格式：[电机ID_L][电机ID_H][flag][寄存器ID][数据4字节]
+                    -- 寄存器读写反馈帧 (CAN ID固定为0x7FF)
+                    -- 数据格式：[电机ID_L][电机ID_H][flag][寄存器ID][数据4字节]
                     local can_id_l = string.byte(data, 1)
                     local can_id_h = string.byte(data, 2)
                     motor_can_id = bit.bor(can_id_l, bit.lshift(can_id_h, 8))
@@ -333,13 +398,17 @@ local function can_callback(can_id, type, param)
                     log.debug("can_rx", string.format("寄存器帧: motor_id=0x%02X, flag=0x%02X, rid=0x%02X",
                         motor_can_id, flag, string.byte(data, 4)))
                 else
-                    -- 控制反馈帧：格式 [MST_ID][ID|ERR<<4][POS_H][POS_L][VEL...][T...][T_MOS][T_Rotor]
-                    -- 从D[1]的低4位提取电机ID
-                    local id_err = string.byte(data, 2)
-                    motor_can_id = bit.band(id_err, 0x0F)  -- 低4位是电机ID
+                    -- 控制反馈帧
+                    -- 达妙电机协议：
+                    -- msg_id = MST_ID（Master ID，默认为0，可通过调试助手设置）
+                    -- D[0] = ID | (ERR << 4)，其中ID是CAN_ID的低8位
+                    -- 从D[0]低4位提取电机ID（注意：只支持ID 0-15）
+                    local d0 = string.byte(data, 1)
+                    motor_can_id = bit.band(d0, 0x0F)  -- 低4位是电机ID
+                    local err = bit.rshift(d0, 4)       -- 高4位是错误/状态码
                     is_register_frame = false
-                    log.debug("can_rx", string.format("控制反馈帧: motor_id=0x%02X, msg_id=0x%03X",
-                        motor_can_id, msg_id))
+                    log.debug("can_rx", string.format("控制反馈帧: msg_id=0x%03X(MST_ID), D[0]=0x%02X, motor_id=0x%02X, err=0x%X",
+                        msg_id, d0, motor_can_id, err))
                 end
 
                 local motor = motors[motor_can_id]
@@ -352,8 +421,9 @@ local function can_callback(can_id, type, param)
                             parse_register_data(motor, rid,
                                 string.byte(data, 5), string.byte(data, 6),
                                 string.byte(data, 7), string.byte(data, 8))
-                        elseif flag == 0x55 then  -- 寄存器写入
+                        elseif flag == 0x55 then  -- 寄存器写入确认
                             log.debug("dm_motor", string.format("电机0x%02X 写入成功", motor_can_id))
+                            motor.response_counter = motor.response_counter + 1  -- 写入确认也算响应
                         end
                     else
                         -- 控制反馈帧：解析位置、速度、扭矩等状态
@@ -444,7 +514,8 @@ function dm_motor.vel_control(motor_can_id, v_des)
     local motor = get_motor(motor_can_id)
     if not motor then return false end
 
-    local data = pack.pack("<f", v_des)
+    -- 速度模式协议: D[0]-D[3]=v_des(float,小端序), D[4]-D[7]=保留(填充0x00)
+    local data = pack.pack("<f", v_des) .. string.char(0x00, 0x00, 0x00, 0x00)
     local can_id = 0x0200 + motor.can_id_l
 
     return can_send(can_id, can.STD, false, true, data)
@@ -452,9 +523,11 @@ end
 
 -- 电机使能/失能/保存零点/清除错误
 function dm_motor.send_mode_command(motor_can_id, mode, command_type)
+    mode = mode or 2  -- 默认位置速度模式（不覆盖传入的mode参数）
     local motor = get_motor(motor_can_id)
     if not motor then return false end
 
+    -- 使用传入的mode参数选择模式
     local mode_info = MODE_DEFINITIONS[mode]
     if not mode_info then
         log.error("dm_motor", string.format("无效模式: %d", mode))
@@ -474,11 +547,11 @@ function dm_motor.send_mode_command(motor_can_id, mode, command_type)
         return false
     end
 
-    -- 根据模式计算正确的 CAN ID
+    -- 使用选定模式对应的CAN ID
     local can_id = mode_info.can_base + motor.can_id_l
 
-    log.info("dm_motor", string.format("发送%s命令: 电机0x%02X, 模式=%d(%s), CAN_ID=0x%03X, 数据=%s",
-        command_type, motor_can_id, mode, mode_info.name, can_id, cmd_data:toHex()))
+    log.info("dm_motor", string.format("发送%s命令: 电机0x%02X, 模式=%s, CAN_ID=0x%03X",
+        command_type, motor_can_id, mode_info.name, can_id))
 
     return can_send(can_id, can.STD, false, true, cmd_data)
 end
@@ -532,6 +605,47 @@ function dm_motor.write_register(motor_can_id, rid, value, is_float)
     return can_send(0x7FF, can.STD, false, true, can_data)
 end
 
+-- 保存参数到Flash（掉电保存）
+-- 注意：必须在失能状态下执行
+function dm_motor.save_param_to_flash(motor_can_id)
+    local motor = get_motor(motor_can_id)
+    if not motor then return false end
+
+    -- 参考MATLAB代码：data_buf = uint8([can_id_l,can_id_h, 0xAA, 1, 0, 0, 0, 0])
+    local can_data = string.char(
+        motor.can_id_l, motor.can_id_h,
+        0xAA, 0x01,  -- 0xAA = 保存参数命令标志
+        0x00, 0x00, 0x00, 0x00
+    )
+
+    log.info("dm_motor", string.format("电机0x%02X 保存参数到Flash", motor_can_id))
+    return can_send(0x7FF, can.STD, false, true, can_data)
+end
+
+-- 刷新电机状态（主动请求电机返回当前状态）
+-- 用于在不发送控制命令时获取电机实时状态
+function dm_motor.refresh_status(motor_can_id)
+    local motor = get_motor(motor_can_id)
+    if not motor then return false end
+
+    -- 参考MATLAB代码：data_buf = uint8([can_id_l,can_id_h, 0xCC, 0, 0, 0, 0, 0])
+    local can_data = string.char(
+        motor.can_id_l, motor.can_id_h,
+        0xCC, 0x00,  -- 0xCC = 刷新状态命令标志
+        0x00, 0x00, 0x00, 0x00
+    )
+
+    log.debug("dm_motor", string.format("电机0x%02X 刷新状态", motor_can_id))
+    return can_send(0x7FF, can.STD, false, false, can_data)
+end
+
+-- 刷新电机状态（带确认）
+function dm_motor.refresh_status_confirmed(motor_can_id, timeout_ms)
+    return dm_motor.send_and_wait(motor_can_id, function()
+        return dm_motor.refresh_status(motor_can_id)
+    end, timeout_ms or 200)
+end
+
 -- 获取电机状态
 function dm_motor.get_state(motor_can_id)
     local motor = get_motor(motor_can_id)
@@ -549,6 +663,81 @@ function dm_motor.get_state(motor_can_id)
         online = motor.online,
         response_counter = motor.response_counter
     }
+end
+
+-- 等待电机响应（通过监测response_counter变化）
+-- motor_can_id: 电机CAN ID
+-- timeout_ms: 超时时间（毫秒）
+-- 返回: true=收到响应, false=超时
+function dm_motor.wait_response(motor_can_id, timeout_ms)
+    local motor = get_motor(motor_can_id)
+    if not motor then return false end
+
+    timeout_ms = timeout_ms or 200  -- 默认200ms超时
+
+    local start_counter = motor.response_counter
+    local wait_interval = 10  -- 每10ms检查一次
+    local elapsed = 0
+
+    while elapsed < timeout_ms do
+        sys.wait(wait_interval)
+        elapsed = elapsed + wait_interval
+
+        if motor.response_counter > start_counter then
+            log.debug("dm_motor", string.format("电机0x%02X 收到响应，耗时%dms", motor_can_id, elapsed))
+            return true
+        end
+    end
+
+    log.warn("dm_motor", string.format("电机0x%02X 等待响应超时 (%dms)", motor_can_id, timeout_ms))
+    return false
+end
+
+-- 检查电机是否在线（基于最近是否有响应）
+function dm_motor.is_online(motor_can_id)
+    local motor = get_motor(motor_can_id)
+    if not motor then return false end
+    return motor.online
+end
+
+-- 发送命令并等待反馈帧
+-- 返回: true=发送成功且收到反馈, false=发送失败或超时无反馈
+function dm_motor.send_and_wait(motor_can_id, send_func, timeout_ms)
+    local motor = get_motor(motor_can_id)
+    if not motor then
+        log.warn("dm_motor", string.format("电机0x%02X 未注册", motor_can_id))
+        return false
+    end
+
+    timeout_ms = timeout_ms or 200
+
+    -- 记录发送前的响应计数
+    local start_counter = motor.response_counter
+
+    -- 执行发送函数
+    local send_ok = send_func()
+    if not send_ok then
+        log.warn("dm_motor", string.format("电机0x%02X CAN发送失败", motor_can_id))
+        return false
+    end
+
+    -- 等待反馈帧（检测response_counter增加）
+    local wait_interval = 10
+    local elapsed = 0
+
+    while elapsed < timeout_ms do
+        sys.wait(wait_interval)
+        elapsed = elapsed + wait_interval
+
+        -- 检查是否收到新的反馈帧
+        if motor.response_counter > start_counter then
+            log.debug("dm_motor", string.format("电机0x%02X 收到反馈帧，耗时%dms", motor_can_id, elapsed))
+            return true
+        end
+    end
+
+    log.warn("dm_motor", string.format("电机0x%02X 等待反馈超时 (%dms)", motor_can_id, timeout_ms))
+    return false
 end
 
 return dm_motor

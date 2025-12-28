@@ -10,7 +10,7 @@
 ]]
 
 PROJECT = "VDM_AIR8000_V1"
-VERSION = "003.000.000"
+VERSION = "000.200.000"
 
 sys = require "sys"
 
@@ -164,10 +164,12 @@ usb_vuart.register_status("ds18b20", function()
     return ds18b20.read_temperature_data()
 end)
 
--- ==================== 6. 电机命令处理 ====================
+-- ==================== 6. 电机命令处理 (异步RESPONSE模式) ====================
+-- 电机命令不返回同步响应，后台执行完成后发送异步RESPONSE/NACK
 
 -- 电机使能 (0x3002)
 -- 数据格式: [motor_id u8][mode u8] (mode: 1=MIT, 2=位置速度, 3=速度)
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_ENABLE, function(seq, data)
     if #data >= 2 then
         local motor_id = data:byte(1)
@@ -175,69 +177,89 @@ usb_vuart.on_cmd(CMD.MOTOR_ENABLE, function(seq, data)
 
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
-            if dm_motor.enable(can_id, true, mode) then
-                motor_status[motor_id].enabled = true
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 已使能, 模式=%d", motor_id, can_id, mode))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 使能失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            -- 后台执行，完成后发送异步响应
+            sys.taskInit(function()
+                if dm_motor.enable_confirmed(can_id, true, mode, 300) then
+                    motor_status[motor_id].enabled = true
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 已使能, 模式=%d", motor_id, can_id, mode))
+                    usb_vuart.send_response(seq, CMD.MOTOR_ENABLE, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 使能失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_ENABLE, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE  -- 不发送同步响应
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
 -- 电机禁用 (0x3003)
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_DISABLE, function(seq, data)
     if #data >= 1 then
         local motor_id = data:byte(1)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
-            if dm_motor.enable(can_id, false, 1) then
-                motor_status[motor_id].enabled = false
-                motor_status[motor_id].action = 0
-                motor_status[motor_id].speed = 0
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 已禁用", motor_id, can_id))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 禁用失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            -- 后台执行，完成后发送异步响应
+            sys.taskInit(function()
+                if dm_motor.enable_confirmed(can_id, false, 2, 300) then
+                    motor_status[motor_id].enabled = false
+                    motor_status[motor_id].action = 0
+                    motor_status[motor_id].speed = 0
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 已禁用", motor_id, can_id))
+                    usb_vuart.send_response(seq, CMD.MOTOR_DISABLE, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 禁用失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_DISABLE, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
 -- 电机急停 (0x3004)
+-- 响应格式: [motor_id u8][success_count u8] (当motor_id=0xFF时)
 usb_vuart.on_cmd(CMD.MOTOR_STOP, function(seq, data)
     if #data >= 1 then
         local motor_id = data:byte(1)
         if motor_id == 0xFF then
-            -- 所有电机急停
-            local success_count = 0
-            for i = 1, #MOTOR_CAN_IDS do
-                local can_id = MOTOR_CAN_IDS[i]
-                -- 发送速度为0的速度控制命令
-                if dm_motor.vel_control(can_id, 0) then
-                    motor_status[i].action = 0
-                    motor_status[i].speed = 0
-                    success_count = success_count + 1
+            -- 所有电机急停 - 后台执行
+            sys.taskInit(function()
+                local success_count = 0
+                for i = 1, #MOTOR_CAN_IDS do
+                    local can_id = MOTOR_CAN_IDS[i]
+                    if dm_motor.vel_control_confirmed(can_id, 0, 200) then
+                        motor_status[i].action = 0
+                        motor_status[i].speed = 0
+                        success_count = success_count + 1
+                    end
                 end
-            end
-            log.info("motor", string.format("所有电机已急停 (%d/%d 成功)", success_count, #MOTOR_CAN_IDS))
-            return RESULT.ACK
+                log.info("motor", string.format("所有电机已急停 (%d/%d)", success_count, #MOTOR_CAN_IDS))
+                if success_count > 0 then
+                    usb_vuart.send_response(seq, CMD.MOTOR_STOP, string.char(0xFF, success_count))
+                else
+                    usb_vuart.send_nack(seq, CMD.MOTOR_STOP, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         elseif motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
-            if dm_motor.vel_control(can_id, 0) then
-                motor_status[motor_id].action = 0
-                motor_status[motor_id].speed = 0
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 已急停", motor_id, can_id))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 急停失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            -- 后台执行
+            sys.taskInit(function()
+                if dm_motor.vel_control_confirmed(can_id, 0, 200) then
+                    motor_status[motor_id].action = 0
+                    motor_status[motor_id].speed = 0
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 已急停", motor_id, can_id))
+                    usb_vuart.send_response(seq, CMD.MOTOR_STOP, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 急停失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_STOP, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         else
             return RESULT.NACK, nil, ERROR.INVALID_PARAM
         end
@@ -247,8 +269,7 @@ end)
 
 -- 电机旋转 (0x3001)
 -- 数据格式: [motor_id u8][angle f32 大端][velocity f32 大端]
--- angle: 目标位置 (弧度)
--- velocity: 目标速度 (弧度/秒)
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_ROTATE, function(seq, data)
     if #data >= 9 then
         local motor_id = data:byte(1)
@@ -260,21 +281,24 @@ usb_vuart.on_cmd(CMD.MOTOR_ROTATE, function(seq, data)
 
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 使用位置速度模式控制电机
-            if dm_motor.pos_control(can_id, angle, velocity) then
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 旋转至 %.2f rad, 速度 %.2f rad/s",
-                    motor_id, can_id, angle, velocity))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 旋转控制失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            -- 后台执行，完成后发送异步响应
+            sys.taskInit(function()
+                if dm_motor.pos_control_confirmed(can_id, angle, velocity, 200) then
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 旋转至 %.2f rad, 速度 %.2f rad/s",
+                        motor_id, can_id, angle, velocity))
+                    usb_vuart.send_response(seq, CMD.MOTOR_ROTATE, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 旋转控制失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
 
--- 电机查询位置 (0x3006)
+-- 电机查询位置 (0x3006) - 从寄存器 0x50 实时读取
 -- 响应格式: [motor_id u8][position f32 大端序]
 usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
     if #data >= 1 then
@@ -283,33 +307,31 @@ usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 记录查询前的响应计数器
-            local state_before = dm_motor.get_state(can_id)
-            local last_counter = state_before and state_before.response_counter or 0
+            -- 使用异步方式：读取寄存器 0x50 (p_m 电机当前位置)
+            sys.taskInit(function()
+                -- 发送读取位置寄存器命令
+                dm_motor.read_register(can_id, 0x50)
 
-            -- 发送位置读取命令
-            dm_motor.read_register(can_id, 0x50)
+                -- 等待电机响应
+                local success = dm_motor.wait_response(can_id, 200)
 
-            -- 使用忙等待循环检查响应（最多50ms，增加等待时间）
-            local max_checks = 5000  -- 5000次检查 ≈ 50ms
-            for i = 1, max_checks do
-                local state_now = dm_motor.get_state(can_id)
-                -- 检查是否收到新的响应（计数器递增）
-                if state_now and state_now.response_counter > last_counter then
-                    -- 构造响应: [motor_id u8][position f32 大端序]
-                    local pos_bytes = string.pack(">f", state_now.position)
-                    local resp_data = string.char(motor_id) .. pos_bytes
-                    log.info("motor", string.format("电机%d (CAN:0x%02X) 位置: %.4f rad (%.2f°) [第%d次响应]",
-                        motor_id, can_id, state_now.position, math.deg(state_now.position), state_now.response_counter))
-                    return RESULT.RESPONSE, resp_data
+                if success then
+                    local state = dm_motor.get_state(can_id)
+                    if state then
+                        local pos_bytes = string.pack(">f", state.position)
+                        local resp_data = string.char(motor_id) .. pos_bytes
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 位置查询(寄存器): %.4f rad (%.2f°)",
+                            motor_id, can_id, state.position, math.deg(state.position)))
+                        usb_vuart.send_response(seq, CMD.MOTOR_GET_POS, resp_data)
+                        return
+                    end
                 end
-                -- 微小延迟，让出一点CPU时间
-                for j = 1, 100 do end  -- 空循环作为延迟
-            end
 
-            -- 超时 - 返回错误而不是缓存值
-            log.error("motor", string.format("电机%d (CAN:0x%02X) 读取超时，未收到CAN响应", motor_id, can_id))
-            return RESULT.NACK, nil, ERROR.TIMEOUT
+                -- 读取失败，返回错误
+                log.error("motor", string.format("电机%d (CAN:0x%02X) 位置查询失败(无响应)", motor_id, can_id))
+                usb_vuart.send_nack(seq, CMD.MOTOR_GET_POS, ERROR.TIMEOUT)
+            end)
+            return RESULT.NONE  -- 异步响应
         else
             log.error("motor", string.format("无效的电机ID: %d (范围: 1-%d)", motor_id, #MOTOR_CAN_IDS))
             return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -320,50 +342,40 @@ usb_vuart.on_cmd(CMD.MOTOR_GET_POS, function(seq, data)
 end)
 
 -- 电机设置原点 (0x3005)
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_SET_ORIGIN, function(seq, data)
     if #data >= 1 then
         local motor_id = data:byte(1)
         if motor_id >= 1 and motor_id <= #MOTOR_CAN_IDS then
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 获取电机当前状态
-            local state = dm_motor.get_state(can_id)
-            if not state then
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 未注册或未初始化", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.NOT_READY
-            end
+            -- 保存零点：需要先失能电机，保存后重新使能并控制到0位置
+            -- 根据达妙电机协议：所有保存参数、修改参数请在失能模式下修改
+            sys.taskInit(function()
+                -- 1. 先失能电机
+                dm_motor.enable(can_id, false, 2)
+                sys.wait(50)
 
-            log.info("motor", string.format("电机%d 设置零点前状态: enabled=%s, error_code=0x%X, position=%.2f",
-                motor_id, state.enabled and "true" or "false", state.error_code, state.position))
+                -- 2. 发送保存零点命令（带确认）
+                local success = dm_motor.save_zero_confirmed(can_id, 2, 300)
+                sys.wait(100)
 
-            -- 如果电机已使能，先失能
-            if state.enabled then
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 使能中，先失能后设置零点", motor_id, can_id))
-                dm_motor.enable(can_id, false, 1)  -- 失能（MIT模式）
+                -- 3. 重新使能电机
+                dm_motor.enable(can_id, true, 2)
+                sys.wait(50)
 
-                -- 等待失能生效（忙等待约50ms）
-                for i = 1, 50000 do
-                    for j = 1, 100 do end
+                -- 4. 发送位置控制命令到0位置，防止电机回到之前的目标位置
+                dm_motor.pos_control(can_id, 0, 1.0)
+
+                if success then
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 保存零点完成", motor_id, can_id))
+                    usb_vuart.send_response(seq, CMD.MOTOR_SET_ORIGIN, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 保存零点命令发送失败", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_SET_ORIGIN, ERROR.EXEC_FAILED)
                 end
-
-                -- 检查失能是否生效
-                local state_after_disable = dm_motor.get_state(can_id)
-                if state_after_disable then
-                    log.info("motor", string.format("电机%d 失能后状态: enabled=%s, error_code=0x%X",
-                        motor_id, state_after_disable.enabled and "true" or "false", state_after_disable.error_code))
-                end
-            end
-
-            -- 调用DM电机的保存零点命令 (使用MIT模式)
-            log.info("motor", string.format("电机%d (CAN:0x%02X) 准备发送save_zero命令...", motor_id, can_id))
-            if dm_motor.save_zero(can_id) then
-                motor_status[motor_id].position = 0
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 已设置原点", motor_id, can_id))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 设置原点失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            end)
+            return RESULT.NONE
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -371,6 +383,7 @@ end)
 
 -- 电机设置速度 (0x3007)
 -- 数据格式: [motor_id u8][velocity f32 大端]
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_SET_VEL, function(seq, data)
     if #data >= 5 then
         local motor_id = data:byte(1)
@@ -381,15 +394,18 @@ usb_vuart.on_cmd(CMD.MOTOR_SET_VEL, function(seq, data)
 
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 使用速度模式控制电机
-            if dm_motor.vel_control(can_id, velocity) then
-                log.info("motor", string.format("电机%d (CAN:0x%02X) 设置速度 %.2f rad/s",
-                    motor_id, can_id, velocity))
-                return RESULT.ACK
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 速度控制失败", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-            end
+            -- 后台执行，完成后发送异步响应
+            sys.taskInit(function()
+                if dm_motor.vel_control_confirmed(can_id, velocity, 200) then
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 设置速度 %.2f rad/s",
+                        motor_id, can_id, velocity))
+                    usb_vuart.send_response(seq, CMD.MOTOR_SET_VEL, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 速度控制失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_SET_VEL, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -397,6 +413,7 @@ end)
 
 -- 电机相对旋转 (0x3008)
 -- 数据格式: [motor_id u8][angle_delta f32 大端][velocity f32 大端]
+-- 响应格式: [motor_id u8]
 usb_vuart.on_cmd(CMD.MOTOR_ROTATE_REL, function(seq, data)
     if #data >= 9 then
         local motor_id = data:byte(1)
@@ -414,18 +431,21 @@ usb_vuart.on_cmd(CMD.MOTOR_ROTATE_REL, function(seq, data)
                 -- 计算目标位置 = 当前位置 + 相对位置
                 local target_pos = state.position + angle_delta
 
-                -- 使用位置速度模式控制电机
-                if dm_motor.pos_control(can_id, target_pos, velocity) then
-                    log.info("motor", string.format("电机%d (CAN:0x%02X) 相对旋转 %.2f rad (从 %.2f -> %.2f), 速度 %.2f rad/s",
-                        motor_id, can_id, angle_delta, state.position, target_pos, velocity))
-                    return RESULT.ACK
-                else
-                    log.error("motor", string.format("电机%d (CAN:0x%02X) 相对旋转失败", motor_id, can_id))
-                    return RESULT.NACK, nil, ERROR.DEVICE_ERROR
-                end
+                -- 后台执行，完成后发送异步响应
+                sys.taskInit(function()
+                    if dm_motor.pos_control_confirmed(can_id, target_pos, velocity, 200) then
+                        log.info("motor", string.format("电机%d (CAN:0x%02X) 相对旋转 %.2f rad (从 %.2f -> %.2f), 速度 %.2f rad/s",
+                            motor_id, can_id, angle_delta, state.position, target_pos, velocity))
+                        usb_vuart.send_response(seq, CMD.MOTOR_ROTATE_REL, string.char(motor_id))
+                    else
+                        log.error("motor", string.format("电机%d (CAN:0x%02X) 相对旋转失败(无响应)", motor_id, can_id))
+                        usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE_REL, ERROR.TIMEOUT)
+                    end
+                end)
+                return RESULT.NONE
             else
                 log.error("motor", string.format("电机%d (CAN:0x%02X) 无法获取当前位置", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.DEVICE_ERROR
+                return RESULT.NACK, nil, ERROR.NOT_READY
             end
         end
     end
@@ -701,7 +721,10 @@ if wdt then
     sys.timerLoopStart(wdt.feed, 3000)
 end
 
--- ==================== 12. 启动系统 ====================
+
+
+-- ==================== 13. 启动系统 ====================
 log.info("main", "VDM Air8000 V1.0协议 系统已启动")
 log.info("main", "帧格式: AA 55 [VER][TYPE][SEQ][CMD][LEN][DATA][CRC]")
+
 sys.run()
