@@ -425,28 +425,39 @@ usb_vuart.on_cmd(CMD.MOTOR_ROTATE_REL, function(seq, data)
 
             local can_id = MOTOR_CAN_IDS[motor_id]
 
-            -- 获取当前位置
-            local state = dm_motor.get_state(can_id)
-            if state then
-                -- 计算目标位置 = 当前位置 + 相对位置
-                local target_pos = state.position + angle_delta
+            -- 后台执行：先读取实时位置，再计算目标位置
+            sys.taskInit(function()
+                -- 1. 先读取最新位置（从寄存器0x50实时读取）
+                dm_motor.read_register(can_id, 0x50)
+                if not dm_motor.wait_response(can_id, 200) then
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 无法读取当前位置", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE_REL, ERROR.TIMEOUT)
+                    return
+                end
 
-                -- 后台执行，完成后发送异步响应
-                sys.taskInit(function()
-                    if dm_motor.pos_control_confirmed(can_id, target_pos, velocity, 200) then
-                        log.info("motor", string.format("电机%d (CAN:0x%02X) 相对旋转 %.2f rad (从 %.2f -> %.2f), 速度 %.2f rad/s",
-                            motor_id, can_id, angle_delta, state.position, target_pos, velocity))
-                        usb_vuart.send_response(seq, CMD.MOTOR_ROTATE_REL, string.char(motor_id))
-                    else
-                        log.error("motor", string.format("电机%d (CAN:0x%02X) 相对旋转失败(无响应)", motor_id, can_id))
-                        usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE_REL, ERROR.TIMEOUT)
-                    end
-                end)
-                return RESULT.NONE
-            else
-                log.error("motor", string.format("电机%d (CAN:0x%02X) 无法获取当前位置", motor_id, can_id))
-                return RESULT.NACK, nil, ERROR.NOT_READY
-            end
+                -- 2. 获取刚读取的位置
+                local state = dm_motor.get_state(can_id)
+                if not state then
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 状态获取失败", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE_REL, ERROR.NOT_READY)
+                    return
+                end
+
+                -- 3. 计算目标位置 = 当前位置 + 相对位置
+                local current_pos = state.position
+                local target_pos = current_pos + angle_delta
+
+                -- 4. 发送位置控制命令
+                if dm_motor.pos_control_confirmed(can_id, target_pos, velocity, 200) then
+                    log.info("motor", string.format("电机%d (CAN:0x%02X) 相对旋转 %.2f rad (从 %.2f -> %.2f), 速度 %.2f rad/s",
+                        motor_id, can_id, angle_delta, current_pos, target_pos, velocity))
+                    usb_vuart.send_response(seq, CMD.MOTOR_ROTATE_REL, string.char(motor_id))
+                else
+                    log.error("motor", string.format("电机%d (CAN:0x%02X) 相对旋转失败(无响应)", motor_id, can_id))
+                    usb_vuart.send_nack(seq, CMD.MOTOR_ROTATE_REL, ERROR.TIMEOUT)
+                end
+            end)
+            return RESULT.NONE
         end
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
