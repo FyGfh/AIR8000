@@ -454,7 +454,7 @@ function dm_motor.can_init()
 
     can.debug(false)
 
-    local can_ret = can.init(CAN_ID, 128)
+    local can_ret = can.init(CAN_ID, 256)
     if not can_ret then
         log.error("dm_motor", "CAN初始化失败")
         return false
