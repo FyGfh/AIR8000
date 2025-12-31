@@ -10,7 +10,7 @@
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.300.000"
+VERSION = "000.300.001"
 
 sys = require "sys"
 
@@ -35,7 +35,25 @@ local ERROR = usb_vuart.ERROR
 local ds18b20 = require "ds18b20_sensor"
 ds18b20.init()
 
--- ==================== 3.2 初始化 DM CAN 电机驱动 ====================
+-- ==================== 3.2 初始化 OTA 升级模块 ====================
+local ota_update = require "ota_update"
+
+-- ==================== 3.3 初始化 MQTT OTA 模块 ====================
+local mqtt_ota = require "mqtt_ota"
+-- 配置MQTT服务器 (可选，使用默认配置则不需要调用)
+-- mqtt_ota.configure({
+--     server = "your-mqtt-server.com",  -- 替换为您的MQTT服务器
+--     port = 1883,
+--     username = "",
+--     password = "",
+-- })
+-- 启动MQTT OTA服务
+mqtt_ota.start()
+
+-- ==================== 3.4 初始化 串口FOTA 模块 ====================
+local uart_fota = require "uart_fota"
+
+-- ==================== 3.5 初始化 DM CAN 电机驱动 ====================
 local dm_motor = require "dm_motor_bridge"
 
 -- 电机CAN ID配置 (根据实际硬件配置修改)
@@ -746,6 +764,122 @@ usb_vuart.on_cmd(CMD.DEV_GET_STATE, function(seq, data)
         return RESULT.RESPONSE, string.char(state)
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- ==================== 7.1 OTA升级命令 ====================
+
+-- 启动OTA升级 (0x6001)
+-- 数据格式: [URL字符串]
+-- 响应格式: ACK表示升级已启动，NACK表示失败
+usb_vuart.on_cmd(CMD.OTA_START, function(seq, data)
+    if #data >= 1 then
+        local url = data
+        log.info("ota_cmd", "收到升级请求", url)
+
+        if ota_update.start(url) then
+            log.info("ota_cmd", "升级已启动")
+            return RESULT.ACK
+        else
+            log.error("ota_cmd", "升级启动失败")
+            return RESULT.NACK, nil, ERROR.DEVICE_BUSY
+        end
+    end
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 查询OTA状态 (0x6002)
+-- 响应格式: [status u8][error_code u8]
+usb_vuart.on_cmd(CMD.OTA_STATUS, function(seq, data)
+    local status, error_code = ota_update.get_status()
+    local resp_data = string.char(status, error_code)
+    log.info("ota_cmd", string.format("状态查询: status=%d, error=%d", status, error_code))
+    return RESULT.RESPONSE, resp_data
+end)
+
+-- 查询版本信息 (0x6003)
+-- 响应格式: [project_len u8][project string][version string(12字节)]
+usb_vuart.on_cmd(CMD.OTA_VERSION, function(seq, data)
+    local project, version, core_ver = ota_update.get_version()
+
+    -- 限制project长度
+    if #project > 32 then
+        project = project:sub(1, 32)
+    end
+
+    -- version格式: XXX.YYY.ZZZ (12字节，不足补0)
+    if #version < 12 then
+        version = version .. string.rep("\0", 12 - #version)
+    elseif #version > 12 then
+        version = version:sub(1, 12)
+    end
+
+    local resp_data = string.char(#project) .. project .. version
+    log.info("ota_cmd", "版本查询", project, version)
+    return RESULT.RESPONSE, resp_data
+end)
+
+-- 设置OTA状态变更通知回调
+ota_update.set_notify_callback(function(status, error_code)
+    -- 发送NOTIFY帧通知Hi3516cv610 OTA状态变更
+    local notify_data = string.char(status, error_code)
+    usb_vuart.notify(0x6002, notify_data)  -- 使用OTA_STATUS命令码
+    log.info("ota_notify", string.format("状态通知: status=%d, error=%d", status, error_code))
+end)
+
+-- ==================== 7.2 串口FOTA升级命令 ====================
+
+-- 开始串口升级 (0x6010)
+-- 数据格式: [firmware_size u32 大端序]
+-- 响应格式: ACK表示准备就绪，NACK表示失败
+usb_vuart.on_cmd(CMD.OTA_UART_START, function(seq, data)
+    log.info("uart_fota_cmd", "收到串口升级开始命令")
+    local success, err = uart_fota.handle_start(data)
+    if success then
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, err or ERROR.EXEC_FAILED
+    end
+end)
+
+-- 固件数据包 (0x6011)
+-- 数据格式: [seq u16 大端序][firmware_data...]
+-- 响应格式: ACK表示收到，NACK表示失败
+usb_vuart.on_cmd(CMD.OTA_UART_DATA, function(seq, data)
+    local success, err = uart_fota.handle_data(data)
+    if success then
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, err or ERROR.EXEC_FAILED
+    end
+end)
+
+-- 升级完成 (0x6012)
+-- 响应格式: ACK表示开始校验，NACK表示失败
+usb_vuart.on_cmd(CMD.OTA_UART_FINISH, function(seq, data)
+    log.info("uart_fota_cmd", "收到串口升级完成命令")
+    local success, err = uart_fota.handle_finish()
+    if success then
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, err or ERROR.EXEC_FAILED
+    end
+end)
+
+-- 取消升级 (0x6013)
+-- 响应格式: ACK
+usb_vuart.on_cmd(CMD.OTA_UART_ABORT, function(seq, data)
+    log.info("uart_fota_cmd", "收到取消升级命令")
+    uart_fota.handle_abort()
+    return RESULT.ACK
+end)
+
+-- 设置串口FOTA状态变更通知回调
+uart_fota.set_notify_callback(function(status, error_code, progress)
+    -- 发送NOTIFY帧通知Hi3516cv610 串口FOTA状态变更
+    local notify_data = string.char(status, error_code, progress)
+    usb_vuart.notify(CMD.OTA_UART_STATUS, notify_data)
+    log.info("uart_fota_notify", string.format("状态通知: status=%d, error=%d, progress=%d%%",
+        status, error_code, progress))
 end)
 
 -- ==================== 8. 传感器命令 ====================

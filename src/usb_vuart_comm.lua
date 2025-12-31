@@ -81,6 +81,18 @@ usb_vuart.CMD = {
     DEV_PWM_LIGHT   = 0x5005,
     DEV_MOTOR_POWER = 0x5006,  -- 电机供电控制
     DEV_GET_STATE   = 0x5010,
+
+    -- OTA升级命令 (0x60xx)
+    OTA_START       = 0x6001,  -- 启动OTA升级 (数据: URL字符串)
+    OTA_STATUS      = 0x6002,  -- 查询OTA状态
+    OTA_VERSION     = 0x6003,  -- 查询版本信息
+
+    -- 串口FOTA升级命令 (0x601x)
+    OTA_UART_START  = 0x6010,  -- 开始串口升级 (数据: [firmware_size u32 大端序])
+    OTA_UART_DATA   = 0x6011,  -- 固件数据包 (数据: [seq u16 大端序][data...])
+    OTA_UART_FINISH = 0x6012,  -- 升级完成
+    OTA_UART_ABORT  = 0x6013,  -- 取消升级
+    OTA_UART_STATUS = 0x6014,  -- 串口升级状态通知
 }
 
 -- 命令处理结果
