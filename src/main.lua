@@ -10,7 +10,7 @@
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.400.002"
+VERSION = "000.400.003"
 
 sys = require "sys"
 

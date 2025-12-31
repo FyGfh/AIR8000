@@ -189,11 +189,11 @@ function uart_fota.handle_data(data)
         return false, uart_fota.ERROR.SEQ_ERROR
     end
 
-    -- 使用复用缓冲区写入数据 (避免频繁分配内存)
-    reusable_buff:seek(0)      -- 重置写入位置
-    reusable_buff:write(payload)
-    reusable_buff:seek(0)      -- 重置读取位置供fota.run使用
-    reusable_buff:used(#payload)  -- 设置有效数据长度
+    -- 使用复用缓冲区写入数据
+    -- 注意: fota.run 需要 zbuff，且会从位置0开始读取 used() 长度的数据
+    reusable_buff:del()        -- 清空缓冲区，重置 used 和位置
+    reusable_buff:write(payload)  -- 写入数据，自动更新 used 长度
+    reusable_buff:seek(0)      -- 重置读取位置供 fota.run 使用
 
     -- 写入FOTA
     local result, isDone, cache = fota.run(reusable_buff)
