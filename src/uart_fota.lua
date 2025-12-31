@@ -63,6 +63,8 @@ local received_size = 0         -- 已接收大小
 local expected_seq = 0          -- 期望的序号
 local fota_initialized = false  -- FOTA是否已初始化
 local notify_callback = nil     -- 通知回调
+local reusable_buff = nil       -- 复用缓冲区，避免频繁分配内存
+local BUFF_SIZE = 1024          -- 缓冲区大小，足够容纳最大数据包
 
 -- ==================== 状态管理 ====================
 local function set_status(status, error_code, progress)
@@ -90,6 +92,11 @@ local function cleanup()
     if fota_initialized then
         fota.finish(false)
         fota_initialized = false
+    end
+    -- 释放复用缓冲区
+    if reusable_buff then
+        reusable_buff:del()
+        reusable_buff = nil
     end
     firmware_size = 0
     received_size = 0
@@ -143,6 +150,12 @@ function uart_fota.handle_start(data)
         return false, uart_fota.ERROR.INIT_FAILED
     end
 
+    -- 创建复用缓冲区 (只创建一次，避免频繁分配内存)
+    if not reusable_buff then
+        reusable_buff = zbuff.create(BUFF_SIZE)
+        log.info("uart_fota", "创建复用缓冲区", BUFF_SIZE, "字节")
+    end
+
     fota_initialized = true
     received_size = 0
     expected_seq = 0
@@ -176,13 +189,14 @@ function uart_fota.handle_data(data)
         return false, uart_fota.ERROR.SEQ_ERROR
     end
 
-    -- 创建zbuff写入数据
-    local buff = zbuff.create(#payload)
-    buff:write(payload)
+    -- 使用复用缓冲区写入数据 (避免频繁分配内存)
+    reusable_buff:seek(0)      -- 重置写入位置
+    reusable_buff:write(payload)
+    reusable_buff:seek(0)      -- 重置读取位置供fota.run使用
+    reusable_buff:used(#payload)  -- 设置有效数据长度
 
     -- 写入FOTA
-    local result, isDone, cache = fota.run(buff)
-    buff:del()
+    local result, isDone, cache = fota.run(reusable_buff)
 
     if not result then
         log.error("uart_fota", "FOTA写入失败")
@@ -195,12 +209,12 @@ function uart_fota.handle_data(data)
     expected_seq = expected_seq + 1
 
     local progress = get_progress()
-    log.info("uart_fota", string.format("收到包 %d, 大小 %d, 进度 %d%%",
-        seq, #payload, progress))
 
     -- 每10%上报一次进度
     if progress % 10 == 0 then
         set_status(uart_fota.STATUS.RECEIVING, uart_fota.ERROR.NONE, progress)
+        log.info("uart_fota", string.format("进度 %d%%, 收到 %d/%d 字节",
+            progress, received_size, firmware_size))
     end
 
     -- 检查是否完成
