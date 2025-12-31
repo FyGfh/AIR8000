@@ -14,7 +14,7 @@ VERSION = "000.400.003"
 
 sys = require "sys"
 
-log.info("Application===>", PROJECT, VERSION)
+log.info("Application<========>", PROJECT, VERSION)
 
 -- ==================== 1. 硬件初始化 ====================
 local MOTOR_PWR_EN_PIN = 33

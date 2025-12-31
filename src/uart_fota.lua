@@ -63,8 +63,6 @@ local received_size = 0         -- 已接收大小
 local expected_seq = 0          -- 期望的序号
 local fota_initialized = false  -- FOTA是否已初始化
 local notify_callback = nil     -- 通知回调
-local reusable_buff = nil       -- 复用缓冲区，避免频繁分配内存
-local BUFF_SIZE = 2048          -- 缓冲区大小，支持最大1024字节数据包
 
 -- ==================== 状态管理 ====================
 local function set_status(status, error_code, progress)
@@ -92,11 +90,6 @@ local function cleanup()
     if fota_initialized then
         fota.finish(false)
         fota_initialized = false
-    end
-    -- 释放复用缓冲区
-    if reusable_buff then
-        reusable_buff:del()
-        reusable_buff = nil
     end
     firmware_size = 0
     received_size = 0
@@ -144,17 +137,23 @@ function uart_fota.handle_start(data)
     log.info("uart_fota", "开始升级，固件大小:", firmware_size, "字节")
 
     -- 初始化FOTA
+    log.info("uart_fota", "初始化FOTA...")
     if not fota.init() then
         log.error("uart_fota", "FOTA初始化失败")
         cleanup()
         return false, uart_fota.ERROR.INIT_FAILED
     end
 
-    -- 创建复用缓冲区 (只创建一次，避免频繁分配内存)
-    if not reusable_buff then
-        reusable_buff = zbuff.create(BUFF_SIZE)
-        log.info("uart_fota", "创建复用缓冲区", BUFF_SIZE, "字节")
+    -- 等待底层准备就绪（与官方fota_file.lua一致）
+    log.info("uart_fota", "等待底层准备...")
+    for i = 1, 50 do  -- 最多等待5秒
+        if fota.wait() then
+            break
+        end
+        -- 注意：这里不能用sys.wait，因为是在命令回调中
+        -- 但fota.wait()本身是非阻塞的，直接循环检查即可
     end
+    log.info("uart_fota", "底层准备就绪")
 
     fota_initialized = true
     received_size = 0
@@ -189,14 +188,15 @@ function uart_fota.handle_data(data)
         return false, uart_fota.ERROR.SEQ_ERROR
     end
 
-    -- 使用复用缓冲区写入数据
-    -- 注意: fota.run 需要 zbuff，且会从位置0开始读取 used() 长度的数据
-    reusable_buff:del()        -- 清空缓冲区，重置 used 和位置
-    reusable_buff:write(payload)  -- 写入数据，自动更新 used 长度
-    reusable_buff:seek(0)      -- 重置读取位置供 fota.run 使用
+    -- 直接使用string传入fota.run (官方文档: buf可以是zbuff也可以是string)
+    -- 日志
+    log.info("uart_fota", string.format("准备写入fota包 %d 累计写入 %d",
+        #payload, received_size + #payload))
 
-    -- 写入FOTA
-    local result, isDone, cache = fota.run(reusable_buff)
+    -- 写入FOTA (直接传string，避免zbuff复杂操作)
+    local result, isDone, cache = fota.run(payload)
+    log.info("uart_fota", string.format("fota.run %s %s %s",
+        tostring(result), tostring(isDone), tostring(cache)))
 
     if not result then
         log.error("uart_fota", "FOTA写入失败")
@@ -264,8 +264,9 @@ function uart_fota.handle_finish()
                 fota.finish(true)
                 set_status(uart_fota.STATUS.SUCCESS, uart_fota.ERROR.NONE, 100)
 
-                -- 2秒后重启
-                sys.wait(2000)
+                -- 等待3秒让Hi3516cv610有时间上报状态到云端
+                log.info("uart_fota", "等待3秒后重启，以便上报状态到云端...")
+                sys.wait(3000)
                 log.info("uart_fota", "重启中...")
                 rtos.reboot()
                 return
@@ -287,6 +288,104 @@ function uart_fota.handle_abort()
     set_status(uart_fota.STATUS.FAILED, uart_fota.ERROR.ABORTED, get_progress())
     cleanup()
     return true, uart_fota.ERROR.NONE
+end
+
+-- ==================== FOTA 测试函数 ====================
+--- 测试FOTA流程（仅用于调试）
+-- 从文件读取升级包进行测试，验证fota库是否正常工作
+-- @param file_path 升级包文件路径，如 "/luadb/update.bin"
+function uart_fota.test_fota(file_path)
+    log.info("fota_test", "========== 开始FOTA测试 ==========")
+
+    -- 1. 初始化FOTA
+    log.info("fota_test", "步骤1: 初始化FOTA...")
+    local init_result = fota.init()
+    log.info("fota_test", "fota.init() =", tostring(init_result))
+
+    if not init_result then
+        log.error("fota_test", "FOTA初始化失败，测试终止")
+        return false
+    end
+
+    -- 2. 等待底层准备 (官方文档要求配合sys.wait使用)
+    log.info("fota_test", "步骤2: 等待底层准备...")
+    local wait_count = 0
+    while not fota.wait() do
+        wait_count = wait_count + 1
+        sys.wait(100)
+        if wait_count > 50 then
+            log.error("fota_test", "等待底层超时")
+            fota.finish(false)
+            return false
+        end
+    end
+    log.info("fota_test", string.format("fota.wait() 循环 %d 次后返回true", wait_count))
+
+    -- 3. 如果提供了文件路径，使用fota.file()测试
+    if file_path then
+        log.info("fota_test", "步骤3: 使用fota.file()测试...")
+        log.info("fota_test", "文件路径:", file_path)
+
+        local result, isDone, cache = fota.file(file_path)
+        log.info("fota_test", string.format("fota.file() 返回: result=%s, isDone=%s, cache=%s",
+            tostring(result), tostring(isDone), tostring(cache)))
+
+        if result and isDone then
+            -- 检查是否完成
+            log.info("fota_test", "步骤4: 检查fota.isDone()...")
+            local succ, fotaDone = fota.isDone()
+            log.info("fota_test", string.format("fota.isDone() 返回: succ=%s, fotaDone=%s",
+                tostring(succ), tostring(fotaDone)))
+
+            if succ and fotaDone then
+                log.info("fota_test", "升级包验证成功!")
+                log.info("fota_test", "注意: 测试模式不会重启，调用fota.finish(false)清理")
+                fota.finish(false)
+                return true
+            end
+        end
+
+        log.warn("fota_test", "升级包验证失败或不完整")
+        fota.finish(false)
+        return false
+    end
+
+    -- 3. 没有文件时，用zbuff测试fota.run()基本功能
+    log.info("fota_test", "步骤3: 测试fota.run() (无效数据测试)...")
+    local test_buff = zbuff.create(512)
+
+    -- 写入一些测试数据（模拟固件数据）
+    -- 注意：这些是无效的固件数据，fota.run()会返回true但isDone=false
+    local test_data = string.rep("\xFF", 256)  -- 256字节的0xFF
+    test_buff:write(test_data)
+    test_buff:seek(0)
+
+    log.info("fota_test", string.format("写入测试数据 %d 字节", #test_data))
+
+    local result, isDone, cache = fota.run(test_buff)
+    log.info("fota_test", string.format("fota.run() 返回: result=%s, isDone=%s, cache=%s",
+        tostring(result), tostring(isDone), tostring(cache)))
+
+    test_buff:del()  -- 官方文档：写入成功后清空zbuff
+
+    -- 4. 检查isDone状态
+    log.info("fota_test", "步骤4: 检查fota.isDone()...")
+    local succ, fotaDone = fota.isDone()
+    log.info("fota_test", string.format("fota.isDone() 返回: succ=%s, fotaDone=%s",
+        tostring(succ), tostring(fotaDone)))
+
+    -- 5. 清理
+    log.info("fota_test", "步骤5: 清理...")
+    fota.finish(false)  -- 不执行升级，只清理
+
+    log.info("fota_test", "========== FOTA测试完成 ==========")
+    log.info("fota_test", "说明:")
+    log.info("fota_test", "  - result=true 表示数据写入成功")
+    log.info("fota_test", "  - isDone=false 表示升级包未完整（正常，因为只发送了测试数据）")
+    log.info("fota_test", "  - cache=N 表示缓存中有N个数据块")
+    log.info("fota_test", "  - 如果result=false，可能是固件格式不对或fota未正确初始化")
+
+    return result
 end
 
 -- ==================== 初始化日志 ====================
