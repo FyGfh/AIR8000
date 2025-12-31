@@ -38,8 +38,8 @@ ds18b20.init()
 -- ==================== 3.2 初始化 OTA 升级模块 ====================
 local ota_update = require "ota_update"
 
--- ==================== 3.3 初始化 MQTT OTA 模块 ====================
-local mqtt_ota = require "mqtt_ota"
+-- ==================== 3.3 初始化 MQTT OTA 模块 (暂时禁用) ====================
+-- local mqtt_ota = require "mqtt_ota"
 -- 配置MQTT服务器 (可选，使用默认配置则不需要调用)
 -- mqtt_ota.configure({
 --     server = "your-mqtt-server.com",  -- 替换为您的MQTT服务器
@@ -48,7 +48,7 @@ local mqtt_ota = require "mqtt_ota"
 --     password = "",
 -- })
 -- 启动MQTT OTA服务
-mqtt_ota.start()
+-- mqtt_ota.start()
 
 -- ==================== 3.4 初始化 串口FOTA 模块 ====================
 local uart_fota = require "uart_fota"
