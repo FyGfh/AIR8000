@@ -64,7 +64,7 @@ local expected_seq = 0          -- 期望的序号
 local fota_initialized = false  -- FOTA是否已初始化
 local notify_callback = nil     -- 通知回调
 local reusable_buff = nil       -- 复用缓冲区，避免频繁分配内存
-local BUFF_SIZE = 1024          -- 缓冲区大小，足够容纳最大数据包
+local BUFF_SIZE = 2048          -- 缓冲区大小，支持最大1024字节数据包
 
 -- ==================== 状态管理 ====================
 local function set_status(status, error_code, progress)
