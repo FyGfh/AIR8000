@@ -219,7 +219,7 @@ local function mqtt_event_callback(client, event, data, payload, metas)
     elseif event == "disconnect" then
         is_connected = false
         log.warn("mqtt_ota", "MQTT连接断开")
-        sys.sendMsg(task_name, "MQTT_EVENT", "DISCONNECTED")
+        sys.publish("MQTT_OTA_EVENT", "DISCONNECTED")
 
     -- 心跳响应
     elseif event == "pong" then
@@ -230,15 +230,22 @@ local function mqtt_event_callback(client, event, data, payload, metas)
         is_connected = false
         log.error("mqtt_ota", "MQTT错误", data)
         if data == "connect" or data == "conack" then
-            sys.sendMsg(task_name, "MQTT_EVENT", "CONNECT_FAILED")
+            sys.publish("MQTT_OTA_EVENT", "CONNECT_FAILED")
         else
-            sys.sendMsg(task_name, "MQTT_EVENT", "ERROR")
+            sys.publish("MQTT_OTA_EVENT", "ERROR")
         end
     end
 end
 
 -- ==================== MQTT主任务 ====================
 local function mqtt_task_func()
+    -- 注册OTA状态变更回调
+    ota_update.set_notify_callback(function(status, error_code)
+        log.info("mqtt_ota", string.format("OTA状态变更: status=%d, error=%d", status, error_code))
+        -- 延迟100ms确保状态已更新
+        sys.timerStart(publish_status, 100)
+    end)
+
     -- 获取IMEI
     imei = mobile.imei()
     if not imei or imei == "" then
@@ -247,15 +254,17 @@ local function mqtt_task_func()
     log.info("mqtt_ota", "设备IMEI:", imei)
 
     while config.enabled do
+        -- 在循环开头声明局部变量，避免goto跨越作用域
+        local client_id
+        local will_topic
+        local will_msg
+
         -- 等待网络就绪
         while not socket.adapter(socket.LWIP_GP) do
             log.info("mqtt_ota", "等待网络...")
             sys.waitUntil("IP_READY", 1000)
         end
         log.info("mqtt_ota", "网络就绪")
-
-        -- 清空消息队列
-        sys.cleanMsg(task_name)
 
         -- 创建MQTT客户端
         mqtt_client = mqtt.create(nil, config.server, config.port)
@@ -266,7 +275,7 @@ local function mqtt_task_func()
         end
 
         -- 配置认证
-        local client_id = "vdm_" .. imei
+        client_id = "vdm_" .. imei
         if not mqtt_client:auth(client_id, config.username, config.password, true) then
             log.error("mqtt_ota", "MQTT认证配置失败")
             mqtt_client:close()
@@ -279,8 +288,8 @@ local function mqtt_task_func()
         mqtt_client:keepalive(config.keepalive)
 
         -- 设置遗嘱消息
-        local will_topic = get_status_topic()
-        local will_msg = json.encode({
+        will_topic = get_status_topic()
+        will_msg = json.encode({
             imei = imei,
             status = "offline",
             timestamp = os.time()
@@ -301,10 +310,10 @@ local function mqtt_task_func()
 
         -- 等待事件
         while true do
-            local msg = sys.waitMsg(task_name, "MQTT_EVENT", 30000)
-            if msg then
-                log.info("mqtt_ota", "收到事件", msg[2], msg[3])
-                if msg[2] == "DISCONNECTED" or msg[2] == "ERROR" or msg[2] == "CONNECT_FAILED" then
+            local result, event = sys.waitUntil("MQTT_OTA_EVENT", 30000)
+            if result then
+                log.info("mqtt_ota", "收到事件", event)
+                if event == "DISCONNECTED" or event == "ERROR" or event == "CONNECT_FAILED" then
                     break
                 end
             else
@@ -320,7 +329,6 @@ local function mqtt_task_func()
 
         -- 清理
         is_connected = false
-        sys.cleanMsg(task_name)
 
         if mqtt_client then
             mqtt_client:close()
@@ -332,14 +340,6 @@ local function mqtt_task_func()
         sys.wait(5000)
     end
 end
-
--- ==================== OTA状态变更回调 ====================
--- 当OTA状态变更时上报到MQTT服务器
-ota_update.set_notify_callback(function(status, error_code)
-    log.info("mqtt_ota", string.format("OTA状态变更: status=%d, error=%d", status, error_code))
-    -- 延迟100ms确保状态已更新
-    sys.timerStart(publish_status, 100)
-end)
 
 -- ==================== 公开接口 ====================
 
