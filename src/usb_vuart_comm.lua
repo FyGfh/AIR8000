@@ -45,6 +45,7 @@ usb_vuart.CMD = {
     SYS_PING      = 0x0001,
     SYS_VERSION   = 0x0002,
     SYS_RESET     = 0x0003,
+    SYS_RESET_HOST = 0x0004,  -- 通知主机(Hi3516)重启
 
     -- 查询命令 (0x01xx)
     QUERY_POWER   = 0x0101,
@@ -93,6 +94,12 @@ usb_vuart.CMD = {
     OTA_UART_FINISH = 0x6012,  -- 升级完成
     OTA_UART_ABORT  = 0x6013,  -- 取消升级
     OTA_UART_STATUS = 0x6014,  -- 串口升级状态通知
+
+    -- 网络配置命令 (0x70xx)
+    NET_SET_APN     = 0x7001,  -- 设置APN (数据: [apn_len u8][apn][user_len u8][user][pwd_len u8][pwd])
+    NET_GET_APN     = 0x7002,  -- 查询APN配置
+    NET_GET_STATUS  = 0x7003,  -- 查询网络状态 (详细)
+    NET_RESET       = 0x7004,  -- 重置网络连接
 }
 
 -- 命令处理结果
@@ -278,8 +285,28 @@ local function handle_request(frame)
         return build_ack(seq, cmd)
 
     elseif cmd == usb_vuart.CMD.SYS_VERSION then
-        -- 返回版本: major, minor, patch + build string
-        local version_data = string.char(0, 0, 3) .. "AIR8000"
+        -- 返回版本信息
+        -- 格式: [major u8][minor u8][patch u8][project_len u8][project string][version string]
+        local project = _G.PROJECT or "VDM_AIR8000"
+        local version_str = _G.VERSION or "000.000.000"
+
+        -- 解析版本号 "000.300.002" -> major=0, minor=300, patch=2
+        local major, minor, patch = 0, 0, 0
+        local m1, m2, m3 = version_str:match("(%d+)%.(%d+)%.(%d+)")
+        if m1 then
+            major = tonumber(m1) or 0
+            minor = tonumber(m2) or 0
+            patch = tonumber(m3) or 0
+        end
+
+        -- 构造响应: [major][minor_h][minor_l][patch_h][patch_l][project_len][project][version_str]
+        local version_data = string.char(
+            major,
+            bit.rshift(minor, 8), bit.band(minor, 0xFF),
+            bit.rshift(patch, 8), bit.band(patch, 0xFF),
+            #project
+        ) .. project .. version_str
+
         return build_response(seq, cmd, version_data)
 
     elseif cmd == usb_vuart.CMD.QUERY_NETWORK then

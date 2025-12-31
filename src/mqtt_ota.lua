@@ -294,7 +294,7 @@ local function mqtt_task_func()
             status = "offline",
             timestamp = os.time()
         })
-        mqtt_client:will(will_topic, will_msg, 1, true)
+        mqtt_client:will(will_topic, will_msg, 1, 1)  -- qos=1, retain=1
 
         -- 注册回调
         mqtt_client:on(mqtt_event_callback)

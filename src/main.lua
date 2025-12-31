@@ -10,20 +10,25 @@
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.300.001"
+VERSION = "000.400.002"
 
 sys = require "sys"
 
-log.info("main", PROJECT, VERSION)
+log.info("Application===>", PROJECT, VERSION)
 
 -- ==================== 1. 硬件初始化 ====================
 local MOTOR_PWR_EN_PIN = 33
 local WIFI_PWR_EN_PIN = 36
+local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
+
 gpio.setup(WIFI_PWR_EN_PIN, 1)
 gpio.setup(MOTOR_PWR_EN_PIN, 1)
+gpio.setup(HOST_PWR_EN_PIN, 1)  -- 默认供电开启
 
--- ==================== 2. 启用USB RNDIS网络透传 ====================
-require "open_ecm"
+-- ==================== 2. 网络配置 (APN + USB以太网) ====================
+-- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
+local network = require "network_config"
+network.init()
 
 -- ==================== 3. 启用USB虚拟串口通信 (V1.0协议) ====================
 local usb_vuart = require "usb_vuart_comm"
@@ -1047,6 +1052,159 @@ sys.timerLoopStart(function()
     local notify_data = string.char(csq, status, sensor_data.battery)
     usb_vuart.notify(0x0002, notify_data)  -- 使用16位命令码
 end, 10000)
+
+-- ==================== 10.1 网络配置命令 ====================
+-- 使用 network_config 模块处理网络配置
+
+-- 设置APN (0x7001)
+-- 数据格式: [apn_len u8][apn string][user_len u8][user string][pwd_len u8][pwd string][auth_type u8]
+-- 注意: 设置后需要重启才能生效，因为APN必须在入网前配置
+usb_vuart.on_cmd(CMD.NET_SET_APN, function(_, data)
+    if #data < 3 then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+
+    local offset = 1
+
+    -- 解析APN
+    local apn_len = data:byte(offset)
+    offset = offset + 1
+    if #data < offset + apn_len then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+    local apn = apn_len > 0 and data:sub(offset, offset + apn_len - 1) or ""
+    offset = offset + apn_len
+
+    -- 解析用户名
+    if #data < offset then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+    local user_len = data:byte(offset)
+    offset = offset + 1
+    if #data < offset + user_len then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+    local user = user_len > 0 and data:sub(offset, offset + user_len - 1) or ""
+    offset = offset + user_len
+
+    -- 解析密码
+    if #data < offset then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+    local pwd_len = data:byte(offset)
+    offset = offset + 1
+    if #data < offset + pwd_len then
+        return RESULT.NACK, nil, ERROR.INVALID_PARAM
+    end
+    local password = pwd_len > 0 and data:sub(offset, offset + pwd_len - 1) or ""
+    offset = offset + pwd_len
+
+    -- 解析认证类型 (可选)
+    local auth_type = 0
+    if #data >= offset then
+        auth_type = data:byte(offset) or 0
+    end
+
+    log.info("net", string.format("设置APN: apn=%s, user=%s, auth=%d", apn, user, auth_type))
+
+    -- 使用network模块保存配置 (重启后自动加载)
+    if network.set_apn(apn, user, password, auth_type) then
+        log.info("net", "APN配置已保存，重启后生效")
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, ERROR.EXEC_FAILED
+    end
+end)
+
+-- 查询APN配置 (0x7002)
+-- 响应格式: [apn_len u8][apn string][user_len u8][user string][auth_type u8]
+usb_vuart.on_cmd(CMD.NET_GET_APN, function()
+    local apn, user, _, auth_type = network.get_apn()
+
+    local resp_data = string.char(#apn) .. apn ..
+                      string.char(#user) .. user ..
+                      string.char(auth_type)
+
+    log.info("net", string.format("查询APN: apn=%s, user=%s, auth=%d", apn, user, auth_type))
+    return RESULT.RESPONSE, resp_data
+end)
+
+-- 查询详细网络状态 (0x7003)
+-- 响应格式: [status u8][csq u8][rssi i8][rsrp i16 大端][snr i8][operator u8][ip_len u8][ip string]
+usb_vuart.on_cmd(CMD.NET_GET_STATUS, function()
+    local resp_data = network.get_status_bytes()
+    local s = network.get_status()
+    log.info("net", string.format("网络状态: status=%d, csq=%d, rssi=%d, rsrp=%d, ip=%s",
+        s.registered, s.csq, s.rssi, s.rsrp, s.ip))
+    return RESULT.RESPONSE, resp_data
+end)
+
+-- 重置网络连接 (0x7004)
+-- 数据格式: 无 或 [飞行模式持续时间 u8 秒]
+usb_vuart.on_cmd(CMD.NET_RESET, function(_, data)
+    local duration = 3  -- 默认飞行模式持续3秒
+    if #data >= 1 then
+        duration = data:byte(1)
+        if duration < 1 then duration = 1 end
+        if duration > 30 then duration = 30 end
+    end
+
+    log.info("net", string.format("重置网络连接，飞行模式持续 %d 秒", duration))
+    network.reset(duration)
+    return RESULT.ACK
+end)
+
+-- ==================== 10.2 系统命令 ====================
+
+-- 系统重启 (0x0003)
+-- 数据格式: 无 或 [delay u8 秒] (延迟重启时间，默认3秒)
+usb_vuart.on_cmd(CMD.SYS_RESET, function(_, data)
+    local delay = 3  -- 默认3秒后重启
+    if #data >= 1 then
+        delay = data:byte(1)
+        if delay < 1 then delay = 1 end
+        if delay > 30 then delay = 30 end
+    end
+
+    log.info("system", string.format("收到重启命令，%d秒后重启", delay))
+
+    -- 先发送ACK确认，然后延迟重启
+    sys.taskInit(function()
+        sys.wait(delay * 1000)
+        log.info("system", "执行重启...")
+        rtos.reboot()
+    end)
+
+    return RESULT.ACK
+end)
+
+-- 主机(Hi3516cv610)重启 (0x0004) - 通过断电重启
+-- 数据格式: 无 或 [off_time u8 秒] (断电持续时间，默认2秒)
+usb_vuart.on_cmd(CMD.SYS_RESET_HOST, function(_, data)
+    local off_time = 2  -- 默认断电2秒
+    if #data >= 1 then
+        off_time = data:byte(1)
+        if off_time < 1 then off_time = 1 end
+        if off_time > 10 then off_time = 10 end
+    end
+
+    log.info("system", string.format("收到主机重启命令，断电 %d 秒", off_time))
+
+    -- 后台执行断电重启
+    sys.taskInit(function()
+        -- 关闭Hi3516cv610供电
+        gpio.set(HOST_PWR_EN_PIN, 0)
+        log.info("system", "Hi3516cv610 供电已关闭")
+
+        sys.wait(off_time * 1000)
+
+        -- 恢复供电
+        gpio.set(HOST_PWR_EN_PIN, 1)
+        log.info("system", "Hi3516cv610 供电已恢复")
+    end)
+
+    return RESULT.ACK
+end)
 
 -- ==================== 11. 看门狗 ====================
 if wdt then
