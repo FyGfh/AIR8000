@@ -10,7 +10,7 @@
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.400.003"
+VERSION = "000.400.005"
 
 sys = require "sys"
 
@@ -23,7 +23,7 @@ local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
 
 gpio.setup(WIFI_PWR_EN_PIN, 1)
 gpio.setup(MOTOR_PWR_EN_PIN, 1)
-gpio.setup(HOST_PWR_EN_PIN, 1)  -- 默认供电开启
+-- gpio.setup(HOST_PWR_EN_PIN, 1)  -- 默认供电开启
 
 -- ==================== 2. 网络配置 (APN + USB以太网) ====================
 -- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
@@ -1180,31 +1180,31 @@ end)
 
 -- 主机(Hi3516cv610)重启 (0x0004) - 通过断电重启
 -- 数据格式: 无 或 [off_time u8 秒] (断电持续时间，默认2秒)
-usb_vuart.on_cmd(CMD.SYS_RESET_HOST, function(_, data)
-    local off_time = 2  -- 默认断电2秒
-    if #data >= 1 then
-        off_time = data:byte(1)
-        if off_time < 1 then off_time = 1 end
-        if off_time > 10 then off_time = 10 end
-    end
+-- usb_vuart.on_cmd(CMD.SYS_RESET_HOST, function(_, data)
+--     local off_time = 2  -- 默认断电2秒
+--     if #data >= 1 then
+--         off_time = data:byte(1)
+--         if off_time < 1 then off_time = 1 end
+--         if off_time > 10 then off_time = 10 end
+--     end
 
-    log.info("system", string.format("收到主机重启命令，断电 %d 秒", off_time))
+--     log.info("system", string.format("收到主机重启命令，断电 %d 秒", off_time))
 
-    -- 后台执行断电重启
-    sys.taskInit(function()
-        -- 关闭Hi3516cv610供电
-        gpio.set(HOST_PWR_EN_PIN, 0)
-        log.info("system", "Hi3516cv610 供电已关闭")
+--     -- 后台执行断电重启
+--     sys.taskInit(function()
+--         -- 关闭Hi3516cv610供电
+--         gpio.set(HOST_PWR_EN_PIN, 0)
+--         log.info("system", "Hi3516cv610 供电已关闭")
 
-        sys.wait(off_time * 1000)
+--         sys.wait(off_time * 1000)
 
-        -- 恢复供电
-        gpio.set(HOST_PWR_EN_PIN, 1)
-        log.info("system", "Hi3516cv610 供电已恢复")
-    end)
+--         -- 恢复供电
+--         gpio.set(HOST_PWR_EN_PIN, 1)
+--         log.info("system", "Hi3516cv610 供电已恢复")
+--     end)
 
-    return RESULT.ACK
-end)
+--     return RESULT.ACK
+-- end)
 
 -- ==================== 11. 看门狗 ====================
 if wdt then
