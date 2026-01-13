@@ -23,6 +23,7 @@ local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
 
 gpio.setup(WIFI_PWR_EN_PIN, 1)
 gpio.setup(MOTOR_PWR_EN_PIN, 1)
+gpio.setup(HOST_PWR_EN_PIN, 1)
 
 -- ==================== 2. 网络配置 (APN + USB以太网) ====================
 -- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
@@ -1214,7 +1215,7 @@ end
 -- ==================== 12. 心跳看门狗 (监控Hi3516cv610) ====================
 -- 当Hi3516cv610长时间未发送心跳时，通过断电重启的方式复位Hi3516cv610
 local hb_wdt = {
-    enabled = false,           -- 是否启用
+    enabled = true,            -- 是否启用 (默认开启)
     timeout_sec = 480,         -- 超时时间(秒), 默认8分钟
     power_off_sec = 2,         -- 断电持续时间(秒)
     grace_period_sec = 5,      -- 优雅关机等待时间(秒)
