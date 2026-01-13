@@ -46,6 +46,9 @@ usb_vuart.CMD = {
     SYS_VERSION   = 0x0002,
     SYS_RESET     = 0x0003,
     SYS_RESET_HOST = 0x0004,  -- 通知主机(Hi3516)重启
+    SYS_HB_WDT_CONFIG  = 0x0006,  -- 心跳看门狗配置
+    SYS_HB_WDT_STATUS  = 0x0007,  -- 心跳看门狗状态查询
+    SYS_HB_POWEROFF    = 0x0008,  -- 心跳超时断电前通知
 
     -- 查询命令 (0x01xx)
     QUERY_POWER   = 0x0101,

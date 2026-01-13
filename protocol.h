@@ -67,6 +67,9 @@ typedef enum {
     CMD_SYS_RESET       = 0x0003,   // 复位
     CMD_SYS_SLEEP       = 0x0004,   // 休眠
     CMD_SYS_WAKEUP      = 0x0005,   // 唤醒
+    CMD_SYS_HB_WDT_CONFIG = 0x0006, // 心跳看门狗配置
+    CMD_SYS_HB_WDT_STATUS = 0x0007, // 心跳看门狗状态查询
+    CMD_SYS_HB_POWEROFF   = 0x0008, // 心跳超时断电前通知 (NOTIFY)
     CMD_SYS_SET_RTC     = 0x0010,   // 设置RTC
     CMD_SYS_GET_RTC     = 0x0011,   // 获取RTC
     CMD_SYS_TEMP_CTRL   = 0x0020,   // 温控

@@ -10,7 +10,7 @@
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.400.005"
+VERSION = "000.500.000"
 
 sys = require "sys"
 
@@ -23,7 +23,6 @@ local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
 
 gpio.setup(WIFI_PWR_EN_PIN, 1)
 gpio.setup(MOTOR_PWR_EN_PIN, 1)
--- gpio.setup(HOST_PWR_EN_PIN, 1)  -- 默认供电开启
 
 -- ==================== 2. 网络配置 (APN + USB以太网) ====================
 -- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
@@ -1212,10 +1211,152 @@ if wdt then
     sys.timerLoopStart(wdt.feed, 3000)
 end
 
+-- ==================== 12. 心跳看门狗 (监控Hi3516cv610) ====================
+-- 当Hi3516cv610长时间未发送心跳时，通过断电重启的方式复位Hi3516cv610
+local hb_wdt = {
+    enabled = false,           -- 是否启用
+    timeout_sec = 480,         -- 超时时间(秒), 默认8分钟
+    power_off_sec = 2,         -- 断电持续时间(秒)
+    grace_period_sec = 5,      -- 优雅关机等待时间(秒)
+    last_heartbeat = 0,        -- 最后一次心跳时间戳(ms)
+    reset_count = 0,           -- 累计复位次数
+    is_resetting = false,      -- 是否正在执行复位
+}
+
+-- 心跳看门狗喂狗 (收到SYS_PING时调用)
+local function hb_wdt_feed()
+    if hb_wdt.enabled then
+        hb_wdt.last_heartbeat = mcu.ticks()
+        log.debug("hb_wdt", "心跳喂狗")
+    end
+end
+
+-- 心跳看门狗检查任务
+sys.taskInit(function()
+    while true do
+        sys.wait(1000)  -- 每秒检查一次
+
+        if hb_wdt.enabled and not hb_wdt.is_resetting then
+            local now = mcu.ticks()
+            local elapsed_ms = now - hb_wdt.last_heartbeat
+            local timeout_ms = hb_wdt.timeout_sec * 1000
+
+            if elapsed_ms >= timeout_ms then
+                -- 超时，执行复位
+                log.warn("hb_wdt", string.format("心跳超时 (%d秒), 执行Hi3516cv610复位", hb_wdt.timeout_sec))
+                hb_wdt.is_resetting = true
+                hb_wdt.reset_count = (hb_wdt.reset_count + 1) % 256
+
+                -- 1. 先发送POWEROFF通知，让Hi3516有机会优雅关机
+                log.info("hb_wdt", "发送POWEROFF通知，等待优雅关机...")
+                usb_vuart.notify(CMD.SYS_HB_POWEROFF, string.char(hb_wdt.reset_count))
+
+                -- 2. 等待优雅关机时间
+                sys.wait(hb_wdt.grace_period_sec * 1000)
+
+                -- 3. 断电复位Hi3516cv610
+                gpio.set(HOST_PWR_EN_PIN, 0)
+                log.info("hb_wdt", string.format("Hi3516cv610 供电已关闭, 将持续 %d 秒", hb_wdt.power_off_sec))
+
+                sys.wait(hb_wdt.power_off_sec * 1000)
+
+                -- 4. 恢复供电
+                gpio.set(HOST_PWR_EN_PIN, 1)
+                log.info("hb_wdt", "Hi3516cv610 供电已恢复，累计复位次数: " .. hb_wdt.reset_count)
+
+                -- 重置心跳计时器，等待Hi3516启动
+                hb_wdt.last_heartbeat = mcu.ticks()
+                hb_wdt.is_resetting = false
+            end
+        end
+    end
+end)
+
+-- 心跳命令处理 (0x0001) - 喂狗
+usb_vuart.on_cmd(CMD.SYS_PING, function(seq, data)
+    hb_wdt_feed()
+    return RESULT.ACK
+end)
+
+-- 心跳看门狗配置命令 (0x0006)
+-- 数据格式: [enable u8][timeout_sec u16 大端][power_off_sec u8]
+usb_vuart.on_cmd(CMD.SYS_HB_WDT_CONFIG, function(seq, data)
+    if #data >= 4 then
+        local enable = data:byte(1)
+        local timeout_sec = data:byte(2) * 256 + data:byte(3)  -- 大端序
+        local power_off_sec = data:byte(4)
+
+        -- 参数验证
+        if enable > 1 then
+            log.warn("hb_wdt", "无效的enable参数:", enable)
+            return RESULT.NACK, nil, ERROR.INVALID_PARAM
+        end
+
+        if timeout_sec < 10 or timeout_sec > 3600 then
+            log.warn("hb_wdt", "超时时间超出范围(10-3600):", timeout_sec)
+            return RESULT.NACK, nil, ERROR.INVALID_PARAM
+        end
+
+        if power_off_sec < 1 or power_off_sec > 30 then
+            log.warn("hb_wdt", "断电时间超出范围(1-30):", power_off_sec)
+            return RESULT.NACK, nil, ERROR.INVALID_PARAM
+        end
+
+        -- 应用配置
+        hb_wdt.timeout_sec = timeout_sec
+        hb_wdt.power_off_sec = power_off_sec
+
+        if enable == 1 and not hb_wdt.enabled then
+            -- 启用看门狗
+            hb_wdt.enabled = true
+            hb_wdt.last_heartbeat = mcu.ticks()  -- 重置计时
+            log.info("hb_wdt", string.format("心跳看门狗已启用: 超时=%d秒, 断电=%d秒",
+                timeout_sec, power_off_sec))
+        elseif enable == 0 and hb_wdt.enabled then
+            -- 禁用看门狗
+            hb_wdt.enabled = false
+            log.info("hb_wdt", "心跳看门狗已禁用")
+        else
+            log.info("hb_wdt", string.format("心跳看门狗配置更新: 超时=%d秒, 断电=%d秒",
+                timeout_sec, power_off_sec))
+        end
+
+        return RESULT.ACK
+    end
+
+    return RESULT.NACK, nil, ERROR.INVALID_PARAM
+end)
+
+-- 心跳看门狗状态查询命令 (0x0007)
+-- 响应格式: [enable u8][timeout_sec u16][power_off_sec u8][remaining_sec u16][reset_count u8]
+usb_vuart.on_cmd(CMD.SYS_HB_WDT_STATUS, function(seq, data)
+    local enable = hb_wdt.enabled and 1 or 0
+    local remaining_sec = 0
+
+    if hb_wdt.enabled then
+        local elapsed_ms = mcu.ticks() - hb_wdt.last_heartbeat
+        remaining_sec = math.max(0, hb_wdt.timeout_sec - math.floor(elapsed_ms / 1000))
+    end
+
+    local resp_data = string.char(
+        enable,
+        bit.rshift(hb_wdt.timeout_sec, 8), bit.band(hb_wdt.timeout_sec, 0xFF),
+        hb_wdt.power_off_sec,
+        bit.rshift(remaining_sec, 8), bit.band(remaining_sec, 0xFF),
+        hb_wdt.reset_count
+    )
+
+    log.info("hb_wdt", string.format("状态查询: enabled=%d, timeout=%d, remaining=%d, resets=%d",
+        enable, hb_wdt.timeout_sec, remaining_sec, hb_wdt.reset_count))
+
+    return RESULT.RESPONSE, resp_data
+end)
 
 
 -- ==================== 13. 启动系统 ====================
 log.info("main", "VDM Air8000 V1.0协议 系统已启动")
 log.info("main", "帧格式: AA 55 [VER][TYPE][SEQ][CMD][LEN][DATA][CRC]")
+log.info("hb_wdt", string.format("心跳看门狗模块已加载 (默认超时=%d秒, 断电=%d秒, 状态=%s)",
+    hb_wdt.timeout_sec, hb_wdt.power_off_sec, hb_wdt.enabled and "启用" or "禁用"))
 
 sys.run()

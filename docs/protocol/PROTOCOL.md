@@ -319,9 +319,244 @@ AA 55 10 01 01 31 02 00 02 01 1B [CRC]
 | 0x0003 | SYS_RESET | [reset_type u8] | 系统复位 |
 | 0x0004 | SYS_SLEEP | [duration_sec u16] | 休眠 |
 | 0x0005 | SYS_WAKEUP | - | 唤醒 |
+| 0x0006 | SYS_HB_WDT_CONFIG | [enable u8][timeout_sec u16][power_off_sec u8] | 心跳看门狗配置 |
+| 0x0007 | SYS_HB_WDT_STATUS | - | 心跳看门狗状态查询 |
+| 0x0008 | SYS_HB_POWEROFF | NOTIFY: [reset_count u8] | 断电前通知 (MCU→Hi3516) |
 | 0x0010 | SYS_SET_RTC | [year u16][mon u8][day u8][hour u8][min u8][sec u8] | 设置RTC |
 | 0x0011 | SYS_GET_RTC | - | 获取RTC |
 | 0x0020 | SYS_TEMP_CTRL | [enable u8][target_temp i16] | 温控设置 |
+
+---
+
+## 心跳看门狗 (Heartbeat Watchdog)
+
+心跳看门狗用于监控 Hi3516cv610 的运行状态。当 MCU 长时间未收到心跳时，会通过 GPIO 断电重启 Hi3516cv610。
+
+### 工作流程
+
+```
+Hi3516cv610                                    Air8000 (MCU)
+    │                                               │
+    │  SYS_HB_WDT_CONFIG (启用看门狗)                │
+    │ ─────────────────────────────────────────────→│ 开始计时
+    │                ACK                            │
+    │ ←─────────────────────────────────────────────│
+    │                                               │
+    │  SYS_PING (心跳)                              │
+    │ ─────────────────────────────────────────────→│ 重置计时器
+    │                ACK                            │
+    │ ←─────────────────────────────────────────────│
+    │                                               │
+    ├──── 定期发送心跳 (建议60秒间隔) ────┤          │
+    │                                               │
+    ╳  Hi3516 崩溃，停止发送心跳                     │
+    │                                               │
+    │                                               │ 超时检测
+    │                                               │
+    │  SYS_HB_POWEROFF (NOTIFY)                     │
+    │ ←─────────────────────────────────────────────│ 通知优雅关机
+    │                                               │
+    │  (Hi3516 执行 sync && poweroff)               │ 等待5秒
+    │                                               │
+    │                                               │ GPIO断电
+    ├──── 断电2秒 ─────┤                            │
+    │                                               │ GPIO上电
+    │  (Hi3516 重新启动)                             │
+    │                                               │
+```
+
+### 0x0006 SYS_HB_WDT_CONFIG - 心跳看门狗配置
+
+**请求数据格式:**
+
+| 字段 | 偏移 | 长度 | 说明 |
+|------|------|------|------|
+| enable | 0 | 1 | 0=禁用, 1=启用 |
+| timeout_sec | 1 | 2 | 超时时间(秒), 大端序, 范围: 10-3600 |
+| power_off_sec | 3 | 1 | 断电持续时间(秒), 范围: 1-30 |
+
+**响应:** ACK (成功) 或 NACK (参数错误)
+
+**示例: 启用看门狗，超时480秒(8分钟)，断电2秒**
+
+```
+请求帧:
+AA 55 10 00 [SEQ] 00 06 00 04 01 01 E0 02 [CRC]
+                              │  │     │
+                              │  │     └─ power_off_sec=2
+                              │  └─────── timeout_sec=480 (0x01E0, 大端序)
+                              └────────── enable=1
+
+响应帧 (成功):
+AA 55 10 03 [SEQ] 00 06 00 00 [CRC]
+```
+
+### 0x0007 SYS_HB_WDT_STATUS - 心跳看门狗状态查询
+
+**请求数据:** 无
+
+**响应数据格式:**
+
+| 字段 | 偏移 | 长度 | 说明 |
+|------|------|------|------|
+| enable | 0 | 1 | 当前状态: 0=禁用, 1=启用 |
+| timeout_sec | 1 | 2 | 配置的超时时间(秒), 大端序 |
+| power_off_sec | 3 | 1 | 配置的断电持续时间(秒) |
+| remaining_sec | 4 | 2 | 距离超时剩余时间(秒), 大端序 |
+| reset_count | 6 | 1 | 累计复位次数 (0-255 循环) |
+
+**示例: 查询状态**
+
+```
+请求帧:
+AA 55 10 00 [SEQ] 00 07 00 00 [CRC]
+
+响应帧:
+AA 55 10 01 [SEQ] 00 07 00 07 01 01 E0 02 01 68 03 [CRC]
+                              │  │     │  │     │
+                              │  │     │  │     └─ reset_count=3
+                              │  │     │  └─────── remaining_sec=360 (0x0168)
+                              │  │     └────────── power_off_sec=2
+                              │  └──────────────── timeout_sec=480 (0x01E0)
+                              └─────────────────── enable=1
+```
+
+### 0x0008 SYS_HB_POWEROFF - 断电前通知 (NOTIFY)
+
+当心跳超时即将断电时，MCU 会发送此通知给 Hi3516cv610，让其有机会执行优雅关机。
+
+**方向:** Air8000 (MCU) → Hi3516cv610
+
+**数据格式:**
+
+| 字段 | 偏移 | 长度 | 说明 |
+|------|------|------|------|
+| reset_count | 0 | 1 | 即将执行的复位次数 |
+
+**示例:**
+
+```
+NOTIFY帧:
+AA 55 10 02 00 00 08 00 01 03 [CRC]
+         │  │              └─ reset_count=3
+         │  └───────────────── SEQ=00 (通知不需要响应)
+         └──────────────────── TYPE=NOTIFY
+
+Hi3516cv610 收到后应执行:
+$ sync && poweroff
+```
+
+**注意:** 收到此通知后，Hi3516cv610 有约5秒时间执行关机操作，之后 MCU 将切断电源。
+
+### 0x0001 SYS_PING - 心跳
+
+复用现有的 PING 命令作为心跳信号。
+
+**请求数据:** 无
+**响应:** ACK
+
+**示例:**
+
+```
+请求帧:
+AA 55 10 00 [SEQ] 00 01 00 00 [CRC]
+
+响应帧:
+AA 55 10 03 [SEQ] 00 01 00 00 [CRC]
+```
+
+### Hi3516cv610 端实现建议
+
+```c
+#include "protocol.h"
+#include <pthread.h>
+#include <unistd.h>
+#include <signal.h>
+
+static int uart_fd = -1;
+static volatile int running = 1;
+
+// POWEROFF通知处理
+void handle_poweroff_notify(uint8_t reset_count) {
+    printf("收到POWEROFF通知，复位次数: %d\n", reset_count);
+    printf("执行优雅关机...\n");
+    system("sync");
+    system("poweroff");
+}
+
+// 心跳发送线程
+void* heartbeat_thread(void* arg) {
+    uint8_t frame[32];
+    static uint8_t seq = 0;
+
+    while (running) {
+        // 构造心跳帧
+        int len = build_request(frame, seq++, CMD_SYS_PING, NULL, 0);
+        write(uart_fd, frame, len);
+
+        // 等待60秒 (建议心跳间隔 = 超时时间 / 8)
+        sleep(60);
+    }
+    return NULL;
+}
+
+// 配置心跳看门狗
+int configure_heartbeat_watchdog(uint8_t enable, uint16_t timeout_sec, uint8_t power_off_sec) {
+    uint8_t frame[32];
+    uint8_t data[4];
+
+    data[0] = enable;
+    data[1] = (timeout_sec >> 8) & 0xFF;  // 大端序高字节
+    data[2] = timeout_sec & 0xFF;         // 大端序低字节
+    data[3] = power_off_sec;
+
+    int len = build_request(frame, 0, CMD_SYS_HB_WDT_CONFIG, data, 4);
+    write(uart_fd, frame, len);
+
+    // 等待ACK响应...
+    return 0;
+}
+
+// 主函数示例
+int main() {
+    uart_fd = open("/dev/ttyACM0", O_RDWR);
+
+    // 配置串口...
+
+    // 配置看门狗: 启用, 超时480秒(8分钟), 断电2秒
+    configure_heartbeat_watchdog(1, 480, 2);
+
+    // 启动心跳线程
+    pthread_t tid;
+    pthread_create(&tid, NULL, heartbeat_thread, NULL);
+
+    // 接收处理循环
+    while (running) {
+        uint8_t frame[256];
+        int len = read_frame(uart_fd, frame, sizeof(frame));
+        if (len > 0) {
+            uint8_t type = frame[3];
+            uint16_t cmd = (frame[5] << 8) | frame[6];
+
+            // 检查是否是POWEROFF通知
+            if (type == TYPE_NOTIFY && cmd == CMD_SYS_HB_POWEROFF) {
+                handle_poweroff_notify(frame[9]);
+            }
+        }
+    }
+
+    return 0;
+}
+```
+
+### 配置建议
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| timeout_sec | 480 (8分钟) | 超时时间，根据应用场景调整 |
+| power_off_sec | 2 | 断电持续时间，通常2秒足够 |
+| 心跳间隔 | 60秒 | 建议设置为超时时间的 1/8 |
+| grace_period | 5秒 (固定) | POWEROFF通知后等待时间 |
 
 ---
 
@@ -545,6 +780,9 @@ AA 55 [VER] [TYPE] [SEQ] [CMD_H CMD_L] [LEN_H LEN_L] [DATA...] [CRC_H CRC_L]
 | CMD | 名称 |
 |------|------|
 | 0x0001 | SYS_PING |
+| 0x0006 | SYS_HB_WDT_CONFIG |
+| 0x0007 | SYS_HB_WDT_STATUS |
+| 0x0008 | SYS_HB_POWEROFF |
 | 0x3001 | MOTOR_ROTATE |
 | 0x3002 | MOTOR_ENABLE |
 | 0x3006 | MOTOR_GET_POS |
