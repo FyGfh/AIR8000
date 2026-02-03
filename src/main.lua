@@ -7,10 +7,36 @@
 本项目实现Air8000与Hi3516cv610的双通道通信：
 1. USB RNDIS - 网络透传，共享4G网络给Hi3516cv610
 2. USB 虚拟串口 - V1.0帧协议命令控制和状态查询
+
+@未实现功能列表
+1. LED控制 (0x5003) - TODO: 实际控制LED
+2. 风扇控制 (0x5002) - TODO: 实际控制风扇 
+3. 加热器控制 (0x5001) - TODO: 实际控制加热器
+4. 激光控制 (0x5004) - TODO: 实际控制激光
+5. PWM补光灯控制 (0x5005) - TODO: 实际控制PWM
+
+@存在模拟或默认值的功能
+1. 设备状态查询 (0x5010) - 返回固定的模拟状态值 (ON)
+2. 温度读取 (0x4001) - DS18B20读取失败时使用默认值25.0°C
+3. ADC电压采集 (0x0101) - ADC功能不可用时使用模拟值
+4. 串口FOTA升级 - 包含测试数据模拟固件写入
+
+@需要实现的功能
+1. 摄像头识别与控制 - air8000 camera库
+2. 图片上传 
+3. 虚拟串口传递文件 
+4. 周期轮询传感器数据，并上报服务器。采集频率可通过服务器设置。 
+5. 支持服务器主动查询，响应 
+6. 声光报警器 -
+7. 充电使能 
+
+@其他情况
+1. mqtt_ota.lua - 该模块被注释掉，未实际使用
+2. else_control.lua - 文件存在但为空
 ]]
 
 PROJECT = "VDM_AIR8000"
-VERSION = "000.500.001"
+VERSION = "000.500.002"
 
 sys = require "sys"
 
@@ -20,10 +46,20 @@ log.info("Application<========>", PROJECT, VERSION)
 local MOTOR_PWR_EN_PIN = 33
 local WIFI_PWR_EN_PIN = 36
 local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
+local GPIO_29 = 29            -- 风扇控制GPIO29
+local GPIO_30 = 30            -- 加热器控制GPIO30
+local GPIO_32 = 32            -- 485 使能引脚
+
+-- 互斥控制标志
+local gpio_manual_control_fan = false  -- true: 命令控制, false: 自动温度控制
+local gpio_manual_control_heat = false 
 
 gpio.setup(WIFI_PWR_EN_PIN, 1)
 gpio.setup(MOTOR_PWR_EN_PIN, 1)
 gpio.setup(HOST_PWR_EN_PIN, 1)
+gpio.setup(GPIO_29, 0)        -- 初始关闭
+gpio.setup(GPIO_30, 0)        -- 初始关闭
+gpio.setup(GPIO_32, 1)
 
 -- ==================== 2. 网络配置 (APN + USB以太网) ====================
 -- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
@@ -39,6 +75,19 @@ local ERROR = usb_vuart.ERROR
 -- ==================== 3.1 初始化 DS18B20 温度传感器 ====================
 local ds18b20 = require "ds18b20_sensor"
 ds18b20.init()
+
+-- ==================== 3.1.1 初始化bmx_sensor ====================
+local bmx = require "bmx_sensor"
+local I2C_ID = 1  -- I2C总线ID
+i2c.setup(I2C_ID, i2c.SLOW)
+sys.taskInit(function()
+    sys.wait(1000)  
+    if bmx.init(I2C_ID) then
+        log.info("bmx", "BME280初始化成功")
+    else
+        log.error("bmx", "BME280初始化失败")
+    end
+end)
 
 -- ==================== 3.2 初始化 OTA 升级模块 ====================
 local ota_update = require "ota_update"
@@ -58,7 +107,29 @@ local ota_update = require "ota_update"
 -- ==================== 3.4 初始化 串口FOTA 模块 ====================
 local uart_fota = require "uart_fota"
 
--- ==================== 3.5 初始化 DM CAN 电机驱动 ====================
+-- ==================== 3.5 初始化 文件传输模块 ====================
+local file_transfer = require "file_transfer"
+
+-- 注册文件传输回调
+file_transfer.set_callback(function(event, data)
+    if event == file_transfer.EVENT.TRANSFER_NOTIFIED then
+        log.info("file_transfer", "已通知CV610传输文件: " .. data.filename)
+    elseif event == file_transfer.EVENT.TRANSFER_STARTED then
+        log.info("file_transfer", "文件传输开始: " .. data.filename .. " (" .. data.total_blocks .. "分片)")
+    elseif event == file_transfer.EVENT.DATA_SENT then
+        log.info("file_transfer", "分片发送成功: " .. data.block_index .. "/" .. data.total_blocks .. " (" .. data.progress .. "%)")
+    elseif event == file_transfer.EVENT.TRANSFER_COMPLETED then
+        log.info("file_transfer", "文件传输完成: " .. data.filename)
+    elseif event == file_transfer.EVENT.TRANSFER_ERROR then
+        log.error("file_transfer", "文件传输错误，错误码: 0x" .. string.format("%02X", data.error_code))
+    elseif event == file_transfer.EVENT.TRANSFER_CANCELLED then
+        log.info("file_transfer", "文件传输已取消")
+    elseif event == file_transfer.EVENT.REQUEST_RECEIVED then
+        log.info("file_transfer", "收到CV610的文件传输请求: " .. data.filename)
+    end
+end)
+
+-- ==================== 3.6 初始化 DM CAN 电机驱动 ====================
 local dm_motor = require "dm_motor_bridge"
 
 -- 电机CAN ID配置 (根据实际硬件配置修改)
@@ -101,17 +172,27 @@ end)
 -- ==================== 4. 业务数据状态 ====================
 local sensor_data = {
     temperature = -99,   -- 将由 DS18B20 更新
-    humidity = 60,
-    battery = 80,
-    light = 128,
+    humidity = 255,      -- 模拟数据：异常值
+    battery = 255,       -- 模拟数据：异常值
+    light = 255,         -- 模拟数据：异常值
+    -- bme280 传感器数据
+    temp = -99,
+    press = 0,
+    hum = 0,
+    -- bme280 子表，用于存储BME280传感器的详细数据
+    bme280 = {
+        temp = -99,
+        press = 0,
+        hum = 0
+    }
 }
 
 -- ==================== 4.1 ADC 配置 ====================
 -- ADC 通道配置 (Air8000: 0=ADC0, 1=ADC1)
 local ADC_CHANNEL_V12 = 0       -- 12V 电压 ADC 通道 (ADC0)
 local ADC_CHANNEL_VBATT = 1     -- 电池电压(4.2V) ADC 通道 (ADC1)
-local ADC_VREF = 3600           -- ADC 参考电压 (mV) - Air8000 内部量程 0-3.6V
-local ADC_RESOLUTION = 4096     -- 12位 ADC (12 bits)
+-- local ADC_VREF = 3600           -- ADC 参考电压 (mV) - Air8000 内部量程 0-3.6V
+-- local ADC_RESOLUTION = 4096     -- 12位 ADC (12 bits)
 -- 分压比根据多点实测数据校准:
 -- 数据点1: 实际10.04V, ADC引脚426.3mV → 分压比 = 23.55
 -- 数据点2: 实际8.05V, ADC引脚333.7mV → 分压比 = 24.12
@@ -146,6 +227,23 @@ usb_vuart.register_status("sensor", function()
     local temp_l = temp % 256
     return string.char(temp_h, temp_l, sensor_data.humidity, sensor_data.light, sensor_data.battery)
 end)
+
+-------------------------------------------------------------------
+-- 传感器状态-BME280
+usb_vuart.register_status("bme280", function()
+    local bme_data = bmx.get_data()
+    if bme_data then
+        -- 返回格式: [temp f32][press f32][hum f32]
+        return string.pack(">fff", 
+            bme_data.temp or 0, 
+            bme_data.press or 0, 
+            bme_data.hum or 0)
+    else
+        -- 返回无效数据
+        return string.pack(">fff", 0, 0, 0)
+    end
+end)
+---------------------------------------------------------------------
 
 -- 电机状态
 -- 返回格式: [电机数量 u8][电机1状态][电机2状态]...
@@ -693,8 +791,19 @@ usb_vuart.on_cmd(CMD.DEV_FAN, function(seq, data)
     if #data >= 2 then
         local device_id = data:byte(1)
         local state = data:byte(2)
-        log.info("device", string.format("风扇 设备%d 状态=%d", device_id, state))
-        -- TODO: 实际控制风扇
+        
+        -- 设置为手动控制模式
+        gpio_manual_control_fan = true
+        
+        -- 实际控制GPIO29
+        if state == 1 then
+            gpio.set(GPIO_29, 1)
+            log.info("device", string.format("风扇 设备%d 已打开 (GPIO29)", device_id))
+        else
+            gpio.set(GPIO_29, 0)
+            log.info("device", string.format("风扇 设备%d 已关闭 (GPIO29)", device_id))
+        end
+        
         return RESULT.ACK
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -705,8 +814,19 @@ usb_vuart.on_cmd(CMD.DEV_HEATER, function(seq, data)
     if #data >= 2 then
         local device_id = data:byte(1)
         local state = data:byte(2)
-        log.info("device", string.format("加热器 设备%d 状态=%d", device_id, state))
-        -- TODO: 实际控制加热器
+        
+        -- 设置为手动控制模式
+        gpio_manual_control_heat = true
+        
+        -- 实际控制GPIO30
+        if state == 1 then
+            gpio.set(GPIO_30, 1)
+            log.info("device", string.format("加热器 设备%d 已打开 (GPIO30)", device_id))
+        else
+            gpio.set(GPIO_30, 0)
+            log.info("device", string.format("加热器 设备%d 已关闭 (GPIO30)", device_id))
+        end
+        
         return RESULT.ACK
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -887,6 +1007,72 @@ uart_fota.set_notify_callback(function(status, error_code, progress)
         status, error_code, progress))
 end)
 
+-- 设置文件传输状态变更通知回调
+file_transfer.set_notify_callback(function(status, error_code, progress)
+    -- 发送NOTIFY帧通知Hi3516cv610 文件传输状态变更
+    local notify_data = string.char(status, error_code, progress)
+    usb_vuart.notify(CMD.FILE_TRANSFER_STATUS, notify_data)
+    log.info("file_transfer_notify", string.format("状态通知: status=%d, error=%d, progress=%d%%",
+        status, error_code, progress))
+end)
+
+
+-- ==================== 11. 文件传输命令 ====================
+
+-- 文件传输请求 (0x6020)
+-- 数据格式: [filename string]
+-- 响应格式: ACK表示准备就绪，NACK表示失败
+usb_vuart.on_cmd(CMD.FILE_TRANSFER_REQUEST, function(seq, data)
+    log.info("file_transfer_cmd", "收到文件传输请求命令")
+    local success = file_transfer.handle_request(data)
+    if success then
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, ERROR.EXEC_FAILED
+    end
+end)
+
+-- 文件传输确认 (0x6021)
+-- 数据格式: [block_index u32 大端序]
+-- 响应格式: ACK表示收到，NACK表示失败
+usb_vuart.on_cmd(CMD.FILE_TRANSFER_ACK, function(seq, data)
+    log.info("file_transfer_cmd", "收到文件传输确认命令")
+    -- 暂时只返回ACK，后续可根据需要实现更复杂的确认处理
+    return RESULT.ACK
+end)
+
+-- 文件传输完成 (0x6022)
+-- 数据格式: [crc32 u32 大端序]
+-- 响应格式: ACK表示收到，NACK表示失败
+usb_vuart.on_cmd(CMD.FILE_TRANSFER_COMPLETE, function(seq, data)
+    log.info("file_transfer_cmd", "收到文件传输完成命令")
+    -- 暂时只返回ACK，后续可根据需要实现更复杂的完成处理
+    return RESULT.ACK
+end)
+
+-- 文件传输错误 (0x6023)
+-- 数据格式: [error_code u32 大端序]
+-- 响应格式: ACK表示收到，NACK表示失败
+usb_vuart.on_cmd(CMD.FILE_TRANSFER_ERROR, function(seq, data)
+    log.info("file_transfer_cmd", "收到文件传输错误命令")
+    -- 暂时只返回ACK，后续可根据需要实现更复杂的错误处理
+    return RESULT.ACK
+end)
+
+-- 文件传输取消 (0x6024)
+-- 数据格式: 无
+-- 响应格式: ACK表示收到，NACK表示失败
+usb_vuart.on_cmd(CMD.FILE_TRANSFER_CANCEL, function(seq, data)
+    log.info("file_transfer_cmd", "收到文件传输取消命令")
+    local success = file_transfer.cancel()
+    if success then
+        return RESULT.ACK
+    else
+        return RESULT.NACK, nil, ERROR.EXEC_FAILED
+    end
+end)
+
+
 -- ==================== 8. 传感器命令 ====================
 
 -- 读取温度 (0x4001) - 使用 DS18B20 传感器
@@ -906,6 +1092,45 @@ usb_vuart.on_cmd(CMD.SENSOR_READ_TEMP, function(seq, data)
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
 end)
+
+-----------------------------------------------------------------------------------------
+-- 读取 BME280 传感器数据 (0x4002) - 使用 BME280 传感器
+usb_vuart.on_cmd(CMD.SENSOR_READ_BME280, function(seq, data)
+    -- 检查bmx模块是否可用
+    if not bmx then
+        log.error("bme280", "BME280模块未加载")
+        return RESULT.NACK, nil, ERROR.NOT_READY
+    end
+
+    -- 尝试获取数据，最多重试3次
+    local bme_data = nil
+    local retry_count = 0
+    while not bme_data and retry_count < 3 do
+        bme_data = bmx.get_data()
+        retry_count = retry_count + 1
+        if not bme_data then
+            sys.wait(100)  -- 等待100ms后重试
+        end
+    end
+
+    if bme_data and bme_data.temp then
+        -- 打包数据：温度(f32) + 气压(f32) + 湿度(f32)
+        local resp_data = string.pack(">fff", 
+            bme_data.temp or 0, 
+            bme_data.press or 0, 
+            bme_data.hum or 0)
+        
+        log.info("bme280", string.format("温度: %.2f°C, 气压: %.2fhPa, 湿度: %.2f%%",
+            bme_data.temp or 0, bme_data.press or 0, bme_data.hum or 0))
+        
+        return RESULT.RESPONSE, resp_data
+    else
+        log.error("bme280", string.format("读取BME280数据失败，重试%d次", retry_count))
+        return RESULT.NACK, nil, ERROR.EXEC_FAILED
+    end
+end)
+---------------------------------------------------------------------------------------------        
+
 
 -- ==================== 9. ADC 电压查询命令 ====================
 
@@ -952,20 +1177,23 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
     local v12_adc_raw = read_adc_samples(ADC_CHANNEL_V12, 5)
 
     -- 读取电池电压ADC原始值 (ADC1)
-    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 5)
+    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 1)
 
     -- 确保原始值是整数
-    v12_adc_raw = math.floor(v12_adc_raw or 0)
+    v12_adc_raw = math.floor(v12_adc_raw or 0)         -- math.floor() 取整
     vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
 
     -- ADC原始值转换为实际电压
     -- adc.get()返回的是ADC原始值(0-4095), 需要转换为mV
     -- 转换公式: voltage_mv = (adc_raw / ADC_RESOLUTION) * ADC_VREF * 分压比
-    local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF      -- ADC引脚电压
-    local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF  -- ADC引脚电压
+    -- local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF      -- ADC引脚电压
+    -- local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF  -- ADC引脚电压
 
-    local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)        -- 实际12V电压
-    local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)  -- 实际电池电压
+    -- local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)        -- 实际12V电压
+    -- local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)  -- 实际电池电压
+
+    local v12_mv = v12_adc_raw * V12_DIVIDER_RATIO
+    local vbatt_mv = vbatt_adc_raw * VBATT_DIVIDER_RATIO
 
     -- 响应格式: [voltage_mv u16 大端][current_ma u16 大端]
     -- 第一个字段：12V主电压, 第二个字段：电池电压
@@ -974,8 +1202,9 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
         bit.rshift(vbatt_mv, 8), bit.band(vbatt_mv, 0xFF)   -- 电池电压高低字节
     )
 
-    log.info("adc", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV VBATT=%dmV",
-        v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, vbatt_mv))
+    -- log.info("adc", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV VBATT=%dmV",
+    --     v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, vbatt_mv))
+    log.info("adc", string.format("ADC原始值： V12=%d VBATT=%d | 实际电压: V12=%dmV VBATT=%dmV", v12_adc_raw, vbatt_adc_raw, v12_mv, vbatt_mv))
 
     return RESULT.RESPONSE, resp_data
 end)
@@ -990,8 +1219,48 @@ sys.timerLoopStart(function()
         log.debug("sensor", string.format("DS18B20 温度更新: %.2f°C", sensor_data.temperature))
     end
     -- 其他传感器数据（如有）
-    sensor_data.humidity = 50 + math.random(0, 20)
-    sensor_data.light = math.random(50, 200)
+    sensor_data.humidity = 255      -- 模拟数据：异常值
+    sensor_data.light = 255         -- 模拟数据：异常值
+    sensor_data.battery = 255       -- 模拟数据：异常值
+
+--------------------------------------------------------------------------------------
+    if bmx then
+        local bme_data = bmx.get_data()
+        if bme_data then
+            sensor_data.bme280.temp = bme_data.temp or 0
+            sensor_data.bme280.press = bme_data.press or 0
+            sensor_data.bme280.hum = bme_data.hum or 0
+        end
+    end
+    -- 打印信息
+    log.info("sensor", string.format("温度: %.2f°C, 压力: %.2f hPa, 湿度: %.2f%%",
+        sensor_data.bme280.temp, sensor_data.bme280.press, sensor_data.bme280.hum))
+    
+    -- 温度控制GPIO29和GPIO30：温度大于30度时打开，否则关闭
+    -- 只有在未被命令控制时，才执行自动温度控制
+    if not gpio_manual_control_heat and not gpio_manual_control_fan then
+        local current_temp = sensor_data.bme280.temp
+        -- 如果BME280数据无效，使用DS18B20温度
+        if current_temp < -90 then
+            current_temp = sensor_data.temperature
+        end
+        
+        if current_temp > 30.0 then
+            log.info("gpio_control", string.format("温度%.2f°C > 30°C，开启GPIO29(风扇)和GPIO30(加热器)", current_temp))
+            gpio.set(GPIO_29, 1)
+            gpio.set(GPIO_30, 1)
+            gpio.setup(31, 0)
+            gpio.setup(16, 0)
+        else
+            log.info("gpio_control", string.format("温度%.2f°C ≤ 30°C，关闭GPIO29(风扇)和GPIO30(加热器)", current_temp))
+            gpio.set(GPIO_29, 0)
+            gpio.set(GPIO_30, 0)
+            gpio.setup(31, 1)
+            gpio.setup(16, 1)
+        end
+    end
+----------------------------------------------------------------------------------------
+
 end, 5000)
 
 -- ADC电压定期采集（调试用）
@@ -1034,15 +1303,21 @@ sys.timerLoopStart(function()
     vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
 
     -- 转换为ADC引脚电压
-    local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF
-    local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF
+    -- local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF
+    -- local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF
 
     -- 计算实际电压
-    local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)
-    local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)
+    -- local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)
+    -- local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)
 
-    log.info("adc_debug", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
-        v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
+    -- log.info("adc_debug", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
+    --     v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
+
+    local v12_mv = v12_adc_raw * V12_DIVIDER_RATIO
+    local vbatt_mv = vbatt_adc_raw * VBATT_DIVIDER_RATIO
+    log.info("adc_debug", string.format("ADC原始值： V12=%d VBATT=%d | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
+        v12_adc_raw, vbatt_adc_raw, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
+
 end, 3000)
 
 -- 定期状态推送到Hi3516cv610（使用NOTIFY帧）

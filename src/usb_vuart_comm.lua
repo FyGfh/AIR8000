@@ -76,6 +76,9 @@ usb_vuart.CMD = {
     -- 传感器命令 (0x40xx)
     SENSOR_READ_TEMP = 0x4001,
     SENSOR_READ_ALL  = 0x4002,
+    SENSOR_READ_BME280  = 0x4003, -- 查询bme280 (温度、湿度、气压)
+    -- 三色灯命令 (0x40xx)
+    LED_SET_COLOR = 0x4004, -- 设置三色灯颜色 (数据: [r u8][g u8][b u8])
 
     -- 设备控制命令 (0x50xx)
     DEV_HEATER      = 0x5001,
@@ -91,6 +94,14 @@ usb_vuart.CMD = {
     OTA_STATUS      = 0x6002,  -- 查询OTA状态
     OTA_VERSION     = 0x6003,  -- 查询版本信息
 
+    -- 文件传输命令 (0x60xx)
+    FILE_TRANSFER_REQUEST = 0x6020,   -- CV610请求Air8000发送文件
+    FILE_TRANSFER_ACK = 0x6021,        -- CV610确认收到分片
+    FILE_TRANSFER_COMPLETE = 0x6022,   -- CV610确认文件传输完成
+    FILE_TRANSFER_ERROR = 0x6023,      -- CV610通知传输错误
+    FILE_TRANSFER_CANCEL = 0x6024,     -- CV610取消文件传输
+    FILE_TRANSFER_STATUS = 0x6026,     -- 文件传输状态通知
+    
     -- 串口FOTA升级命令 (0x601x)
     OTA_UART_START  = 0x6010,  -- 开始串口升级 (数据: [firmware_size u32 大端序])
     OTA_UART_DATA   = 0x6011,  -- 固件数据包 (数据: [seq u16 大端序][data...])
