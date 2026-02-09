@@ -8,31 +8,6 @@
 1. USB RNDIS - 网络透传，共享4G网络给Hi3516cv610
 2. USB 虚拟串口 - V1.0帧协议命令控制和状态查询
 
-@未实现功能列表
-1. LED控制 (0x5003) - TODO: 实际控制LED
-2. 风扇控制 (0x5002) - TODO: 实际控制风扇 
-3. 加热器控制 (0x5001) - TODO: 实际控制加热器
-4. 激光控制 (0x5004) - TODO: 实际控制激光
-5. PWM补光灯控制 (0x5005) - TODO: 实际控制PWM
-
-@存在模拟或默认值的功能
-1. 设备状态查询 (0x5010) - 返回固定的模拟状态值 (ON)
-2. 温度读取 (0x4001) - DS18B20读取失败时使用默认值25.0°C
-3. ADC电压采集 (0x0101) - ADC功能不可用时使用模拟值
-4. 串口FOTA升级 - 包含测试数据模拟固件写入
-
-@需要实现的功能
-1. 摄像头识别与控制 - air8000 camera库
-2. 图片上传 
-3. 虚拟串口传递文件 
-4. 周期轮询传感器数据，并上报服务器。采集频率可通过服务器设置。 
-5. 支持服务器主动查询，响应 
-6. 声光报警器 -
-7. 充电使能 
-
-@其他情况
-1. mqtt_ota.lua - 该模块被注释掉，未实际使用
-2. else_control.lua - 文件存在但为空
 ]]
 
 PROJECT = "VDM_AIR8000"
@@ -49,6 +24,8 @@ local HOST_PWR_EN_PIN = 34   -- Hi3516cv610 供电控制引脚
 local GPIO_29 = 29            -- 风扇控制GPIO29
 local GPIO_30 = 30            -- 加热器控制GPIO30
 local GPIO_32 = 32            -- 485 使能引脚
+local PWR_LED_8000 = 16       -- 8000板电源状态LED GPIO16
+local NET_STATUS_8000 = 17    -- 8000板网络状态LED GPIO17
 
 -- 互斥控制标志
 local gpio_manual_control_fan = false  -- true: 命令控制, false: 自动温度控制
@@ -60,6 +37,8 @@ gpio.setup(HOST_PWR_EN_PIN, 1)
 gpio.setup(GPIO_29, 0)        -- 初始关闭
 gpio.setup(GPIO_30, 0)        -- 初始关闭
 gpio.setup(GPIO_32, 1)
+gpio.setup(PWR_LED_8000, 0)   -- 初始关闭
+gpio.setup(NET_STATUS_8000, 0) -- 初始关闭
 
 -- ==================== 2. 网络配置 (APN + USB以太网) ====================
 -- 必须在入网前初始化，会自动加载fskv中的APN配置并启用ECM/RNDIS
@@ -175,6 +154,7 @@ local sensor_data = {
     humidity = 255,      -- 模拟数据：异常值
     battery = 255,       -- 模拟数据：异常值
     light = 255,         -- 模拟数据：异常值
+    cpu_temp = -99,      -- CPU温度
     -- bme280 传感器数据
     temp = -99,
     press = 0,
@@ -191,8 +171,8 @@ local sensor_data = {
 -- ADC 通道配置 (Air8000: 0=ADC0, 1=ADC1)
 local ADC_CHANNEL_V12 = 0       -- 12V 电压 ADC 通道 (ADC0)
 local ADC_CHANNEL_VBATT = 1     -- 电池电压(4.2V) ADC 通道 (ADC1)
--- local ADC_VREF = 3600           -- ADC 参考电压 (mV) - Air8000 内部量程 0-3.6V
--- local ADC_RESOLUTION = 4096     -- 12位 ADC (12 bits)
+local ADC_VREF = 3600           -- ADC 参考电压 (mV) - Air8000 内部量程 0-3.6V
+local ADC_RESOLUTION = 4096     -- 12位 ADC (12 bits)
 -- 分压比根据多点实测数据校准:
 -- 数据点1: 实际10.04V, ADC引脚426.3mV → 分压比 = 23.55
 -- 数据点2: 实际8.05V, ADC引脚333.7mV → 分压比 = 24.12
@@ -283,6 +263,14 @@ end)
 -- DS18B20 温度状态
 usb_vuart.register_status("ds18b20", function()
     return ds18b20.read_temperature_data()
+end)
+
+-- CPU温度状态
+usb_vuart.register_status("cpu_temp", function()
+    -- 实时读取CPU温度
+    local cpu_temp = read_cpu_temperature()
+    -- 响应格式: [cpu_temp f32 大端序]
+    return string.pack(">f", cpu_temp)
 end)
 
 -- ==================== 6. 电机命令处理 (异步RESPONSE模式) ====================
@@ -780,7 +768,12 @@ usb_vuart.on_cmd(CMD.DEV_LED, function(seq, data)
         local device_id = data:byte(1)
         local state = data:byte(2)
         log.info("device", string.format("LED 设备%d 状态=%d", device_id, state))
-        -- TODO: 实际控制LED
+        -- state = 0，两个灯都关
+        -- state = 1，8000板电源状态LED亮，网络状态LED灭
+        -- state = 2，8000板电源状态LED灭，网络状态LED亮
+        -- state = 3，8000板电源状态LED亮，网络状态LED亮
+        gpio.set(PWR_LED_8000, state == 1 or state == 3)
+        gpio.set(NET_STATUS_8000, state == 2 or state == 3)
         return RESULT.ACK
     end
     return RESULT.NACK, nil, ERROR.INVALID_PARAM
@@ -1129,10 +1122,88 @@ usb_vuart.on_cmd(CMD.SENSOR_READ_BME280, function(seq, data)
         return RESULT.NACK, nil, ERROR.EXEC_FAILED
     end
 end)
+
+-- 读取CPU温度 (0x4003) - 使用ADC CH_CPU通道
+usb_vuart.on_cmd(CMD.SENSOR_READ_CPU_TEMP, function(seq, data)
+    -- 读取CPU温度
+    local cpu_temp = read_cpu_temperature()
+    
+    if cpu_temp ~= -99 then
+        -- 响应格式: [cpu_temp f32 大端序]
+        local temp_bytes = string.pack(">f", cpu_temp)
+        log.info("cpu_temp", string.format("CPU温度: %.2f°C", cpu_temp))
+        return RESULT.RESPONSE, temp_bytes
+    else
+        log.error("cpu_temp", "读取CPU温度失败")
+        return RESULT.NACK, nil, ERROR.EXEC_FAILED
+    end
+end)
 ---------------------------------------------------------------------------------------------        
 
 
 -- ==================== 9. ADC 电压查询命令 ====================
+
+-- ADC 拟合参数 (y = ax + b, x = (y - b) / a)
+local ADC0_SLOPE_SINGLE = 88.62      -- 场景1：单电源 ADC0斜率
+local ADC0_INTERCEPT_SINGLE = 114.12 -- 场景1：单电源 ADC0截距
+local ADC0_SLOPE_DUAL = 87.05        -- 场景2：双供电 ADC0斜率
+local ADC0_INTERCEPT_DUAL = 99.32    -- 场景2：双供电 ADC0截距
+local ADC1_SLOPE = 186.52            -- 场景3：仅电池 ADC1斜率
+local ADC1_INTERCEPT = 149.05        -- 场景3：仅电池 ADC1截距
+local ADC_BATT_PRESENT_THRESHOLD = 500 -- 判定电池存在的ADC阈值 (约2V)
+
+-- 读取CPU温度函数
+local function read_cpu_temperature()
+    local cpu_temp = read_adc_channel(adc.CH_CPU, 10, true)
+    if cpu_temp then
+        return cpu_temp
+    else
+        log.warn("cpu_temp", "ADC功能不可用或读取失败，无法读取CPU温度")
+        return -99
+    end
+end
+
+-- 统一的ADC读取函数
+local function read_adc_channel(channel, num_samples, is_cpu_temp)
+    if not adc then
+        return nil
+    end
+    
+    local samples = {}
+    
+    -- 只有ADC0和ADC1通道使用ADC_RANGE_MIN量程，提高精度
+    if channel == ADC_CHANNEL_V12 or channel == ADC_CHANNEL_VBATT then
+        adc.setRange(adc.ADC_RANGE_MIN)
+    end
+    adc.open(channel)
+    for i = 1, num_samples do
+        table.insert(samples, adc.get(channel))
+    end
+    adc.close(channel)
+    
+    -- 排序并去掉极值
+    if #samples > 2 then
+        table.sort(samples)
+        local sum = 0
+        for i = 2, #samples - 1 do
+            sum = sum + samples[i]
+        end
+        local avg_value = sum / (#samples - 2)
+        if is_cpu_temp then
+            return avg_value / 1000.0  -- 转换为摄氏度
+        else
+            return avg_value
+        end
+    else
+        return nil
+    end
+end
+
+-- 线性拟合计算电压 (返回mV)
+local function calc_voltage_linear(adc_raw, slope, intercept)
+    if adc_raw <= intercept then return 0 end
+    return math.floor((adc_raw - intercept) / slope * 1000)
+end
 
 -- 读取 ADC 电压 (0x0101 QUERY_POWER)
 usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
@@ -1148,52 +1219,38 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
         return RESULT.RESPONSE, resp_data
     end
 
-    -- ADC采样函数 (参考官方示例)
-    local function read_adc_samples(channel, num_samples)
-        adc.setRange(adc.ADC_RANGE_MAX)  -- Air8000 ADC 量程 0-3.6V (内部分压开启)
-        adc.open(channel)
-
-        local samples = {}
-        for i = 1, num_samples do
-            table.insert(samples, adc.get(channel))
-        end
-
-        adc.close(channel)
-
-        -- 排序并去掉极值
-        if #samples > 2 then
-            table.sort(samples)
-            local sum = 0
-            for i = 2, #samples - 1 do
-                sum = sum + samples[i]
-            end
-            return sum / (#samples - 2)  -- 返回平均值
-        else
-            return samples[1] or 0
-        end
-    end
-
     -- 读取12V电压ADC原始值 (ADC0)
-    local v12_adc_raw = read_adc_samples(ADC_CHANNEL_V12, 5)
+    local v12_adc_raw = read_adc_channel(ADC_CHANNEL_V12, 5, false)
 
     -- 读取电池电压ADC原始值 (ADC1)
-    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 1)
+    local vbatt_adc_raw = read_adc_channel(ADC_CHANNEL_VBATT, 5, false)
 
-    -- 确保原始值是整数
-    v12_adc_raw = math.floor(v12_adc_raw or 0)         -- math.floor() 取整
-    vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
+    -- 确保读取成功
+    if not v12_adc_raw or not vbatt_adc_raw then
+        log.warn("adc", "ADC读取失败，使用模拟值")
+        -- 使用模拟值
+        local mock_vbatt = 0  -- 12.5V
+        local mock_v12 = 0    -- 12.0V
+        local resp_data = string.char(
+            bit.rshift(mock_vbatt, 8), bit.band(mock_vbatt, 0xFF),
+            bit.rshift(mock_v12, 8), bit.band(mock_v12, 0xFF)
+        )
+        return RESULT.RESPONSE, resp_data
+    end
 
-    -- ADC原始值转换为实际电压
-    -- adc.get()返回的是ADC原始值(0-4095), 需要转换为mV
-    -- 转换公式: voltage_mv = (adc_raw / ADC_RESOLUTION) * ADC_VREF * 分压比
-    -- local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF      -- ADC引脚电压
-    -- local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF  -- ADC引脚电压
-
-    -- local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)        -- 实际12V电压
-    -- local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)  -- 实际电池电压
-
-    local v12_mv = v12_adc_raw * V12_DIVIDER_RATIO
-    local vbatt_mv = vbatt_adc_raw * VBATT_DIVIDER_RATIO
+    -- 根据电池是否存在判断V12使用哪个公式
+    local v12_mv = 0
+    if vbatt_adc_raw > ADC_BATT_PRESENT_THRESHOLD then
+        -- 电池存在 -> 场景2：双供电公式
+        v12_mv = calc_voltage_linear(v12_adc_raw, ADC0_SLOPE_DUAL, ADC0_INTERCEPT_DUAL)
+    else
+        -- 电池不存在 -> 场景1：单电源公式
+        v12_mv = calc_voltage_linear(v12_adc_raw, ADC0_SLOPE_SINGLE, ADC0_INTERCEPT_SINGLE)
+    end
+    -- 修正ADC0测量值偏低1V的问题
+    v12_mv = v12_mv + 1000
+    -- 计算电池电压（仅使用电池的计算公式）
+    local vbatt_mv = calc_voltage_linear(vbatt_adc_raw, ADC1_SLOPE, ADC1_INTERCEPT)
 
     -- 响应格式: [voltage_mv u16 大端][current_ma u16 大端]
     -- 第一个字段：12V主电压, 第二个字段：电池电压
@@ -1202,9 +1259,8 @@ usb_vuart.on_cmd(CMD.QUERY_POWER, function(seq, data)
         bit.rshift(vbatt_mv, 8), bit.band(vbatt_mv, 0xFF)   -- 电池电压高低字节
     )
 
-    -- log.info("adc", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV VBATT=%dmV",
-    --     v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, vbatt_mv))
-    log.info("adc", string.format("ADC原始值： V12=%d VBATT=%d | 实际电压: V12=%dmV VBATT=%dmV", v12_adc_raw, vbatt_adc_raw, v12_mv, vbatt_mv))
+    log.info("adc", string.format("ADC原始值: V12=%.1f VBATT=%.1f | 电源电压: V12=%dmV | 电池电压: VBATT=%dmV",
+        v12_adc_raw, vbatt_adc_raw, v12_mv, vbatt_mv))
 
     return RESULT.RESPONSE, resp_data
 end)
@@ -1263,61 +1319,45 @@ sys.timerLoopStart(function()
 
 end, 5000)
 
--- ADC电压定期采集（调试用）
+-- ADC电压和CPU温度定期采集（调试用）
 sys.timerLoopStart(function()
     if not adc then
         return
     end
 
-    -- ADC采样函数
-    local function read_adc_samples(channel, num_samples)
-        adc.setRange(adc.ADC_RANGE_MAX)  -- Air8000 ADC 量程 0-3.6V (内部分压开启)
-        adc.open(channel)
-
-        local samples = {}
-        for i = 1, num_samples do
-            table.insert(samples, adc.get(channel))
-        end
-
-        adc.close(channel)
-
-        -- 排序并去掉极值
-        if #samples > 2 then
-            table.sort(samples)
-            local sum = 0
-            for i = 2, #samples - 1 do
-                sum = sum + samples[i]
-            end
-            return sum / (#samples - 2)
-        else
-            return samples[1] or 0
-        end
-    end
-
     -- 读取ADC原始值
-    local v12_adc_raw = read_adc_samples(ADC_CHANNEL_V12, 5)
-    local vbatt_adc_raw = read_adc_samples(ADC_CHANNEL_VBATT, 5)
+    local v12_adc_raw = read_adc_channel(ADC_CHANNEL_V12, 5, false)
+    local vbatt_adc_raw = read_adc_channel(ADC_CHANNEL_VBATT, 5, false)
+    local cpu_temp = read_adc_channel(adc.CH_CPU, 10, true)
 
-    -- 确保原始值是整数
-    v12_adc_raw = math.floor(v12_adc_raw or 0)
-    vbatt_adc_raw = math.floor(vbatt_adc_raw or 0)
+    -- 确保所有值都有效
+    if v12_adc_raw and vbatt_adc_raw then
+        local v12_mv = 0
+        local scenario = "未知"
+        if vbatt_adc_raw > ADC_BATT_PRESENT_THRESHOLD then
+            -- 电池存在 -> 场景2
+            v12_mv = calc_voltage_linear(v12_adc_raw, ADC0_SLOPE_DUAL, ADC0_INTERCEPT_DUAL)
+            scenario = "双供电(Bat+Power)"
+        else
+            -- 电池不存在 -> 场景1
+            v12_mv = calc_voltage_linear(v12_adc_raw, ADC0_SLOPE_SINGLE, ADC0_INTERCEPT_SINGLE)
+            scenario = "单电源(NoBatt)"
+        end
 
-    -- 转换为ADC引脚电压
-    -- local v12_adc_mv = (v12_adc_raw / ADC_RESOLUTION) * ADC_VREF
-    -- local vbatt_adc_mv = (vbatt_adc_raw / ADC_RESOLUTION) * ADC_VREF
-
-    -- 计算实际电压
-    -- local v12_mv = math.floor(v12_adc_mv * V12_DIVIDER_RATIO)
-    -- local vbatt_mv = math.floor(vbatt_adc_mv * VBATT_DIVIDER_RATIO)
-
-    -- log.info("adc_debug", string.format("ADC原始值: V12=%d VBATT=%d | ADC电压: V12=%.1fmV VBATT=%.1fmV | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
-    --     v12_adc_raw, vbatt_adc_raw, v12_adc_mv, vbatt_adc_mv, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
-
-    local v12_mv = v12_adc_raw * V12_DIVIDER_RATIO
-    local vbatt_mv = vbatt_adc_raw * VBATT_DIVIDER_RATIO
-    log.info("adc_debug", string.format("ADC原始值： V12=%d VBATT=%d | 实际电压: V12=%dmV(%.2fV) VBATT=%dmV(%.2fV)",
-        v12_adc_raw, vbatt_adc_raw, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
-
+        -- 计算电池电压（仅使用电池的计算公式）
+        local vbatt_mv = calc_voltage_linear(vbatt_adc_raw, ADC1_SLOPE, ADC1_INTERCEPT)
+        
+        -- 打印ADC信息
+        log.info("adc_debug", string.format("ADC原始值: V12=%.1f VBATT=%.1f | 场景: %s | 电源电压: V12=%dmV(%.2fV) | 电池电压: VBATT=%dmV(%.2fV)",
+            v12_adc_raw, vbatt_adc_raw, scenario, v12_mv, v12_mv/1000.0, vbatt_mv, vbatt_mv/1000.0))
+    end
+    
+    -- 打印CPU温度
+    if cpu_temp then
+        log.info("cpu_temp", string.format("CPU温度: %.2f°C", cpu_temp))
+    else
+        log.warn("cpu_temp", "无法读取CPU温度")
+    end
 end, 3000)
 
 -- 定期状态推送到Hi3516cv610（使用NOTIFY帧）
